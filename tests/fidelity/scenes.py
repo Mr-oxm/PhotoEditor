@@ -152,16 +152,27 @@ def scene_group() -> Document:
 
 
 def scene_nested_group() -> Document:
+    """Groups inside groups, with content the blend modes act on.
+
+    The MULTIPLY layer needs something beneath it *inside the group* --
+    a group composites onto a transparent canvas, so multiplying against
+    that gives uniform black and the whole scene becomes a useless
+    all-zero reference that no rendering change could ever perturb.
+    """
     doc = _blank_doc("nested-group")
     _add(doc, _gradient(W, H, 18), "bg")
     outer = Layer(name="outer", width=W, height=H, layer_type=LayerType.GROUP)
     doc.layers.add(outer)
+    # Opaque base inside the group, so the modes above it have a substrate.
+    _add(doc, _gradient(W, H, 60), "group-base", parent_id=outer.id)
     inner = Layer(name="inner", width=W, height=H, layer_type=LayerType.GROUP)
     inner.parent_id = outer.id
     doc.layers.add(inner)
-    _add(doc, _radial_alpha(W, H, 19), "deep", parent_id=inner.id)
+    _add(doc, _radial_alpha(W, H, 19), "deep", parent_id=inner.id,
+         opacity=0.8)
     _add(doc, _gradient(W, H, 20), "shallow", parent_id=outer.id,
-         blend_mode=BlendMode.MULTIPLY)
+         blend_mode=BlendMode.MULTIPLY, opacity=0.7)
+    outer.opacity = 0.9
     return doc
 
 

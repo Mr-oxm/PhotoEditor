@@ -28,7 +28,7 @@ def _apply_mode(doc: Document, new_mask: np.ndarray, mode: str) -> None:
     """Combine *new_mask* into the document selection according to *mode*."""
     sel = doc.selection
     if mode == "new" or sel._mask is None:
-        sel._mask = new_mask
+        sel._set_mask(new_mask)
         return
     old = sel._mask
     # Ensure same shape — pad / crop if needed
@@ -44,14 +44,18 @@ def _apply_mode(doc: Document, new_mask: np.ndarray, mode: str) -> None:
             nh, nw = min(new_mask.shape[0], h), min(new_mask.shape[1], w)
             tmp[:nh, :nw] = new_mask[:nh, :nw]
             new_mask = tmp
+    # Through _set_mask, so Selection.version moves. The canvas skips
+    # re-tracing marching-ants contours and the transform box reuses cached
+    # bounds when the version is unchanged, so a direct assignment left both
+    # showing the previous selection.
     if mode == "add":
-        sel._mask = np.maximum(old, new_mask)
+        sel._set_mask(np.maximum(old, new_mask))
     elif mode == "subtract":
-        sel._mask = np.clip(old - new_mask, 0, 1)
+        sel._set_mask(np.clip(old - new_mask, 0, 1))
     elif mode == "intersect":
-        sel._mask = np.minimum(old, new_mask)
+        sel._set_mask(np.minimum(old, new_mask))
     else:
-        sel._mask = new_mask
+        sel._set_mask(new_mask)
 
 
 # ======================================================================
