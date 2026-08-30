@@ -819,3 +819,61 @@ def test_concurrent_saves_do_not_share_a_temp_path(tmp_path):
     loaded = load_basera_project(target)
     assert any(l.name == "L" for l in loaded.layers)
     assert not list(tmp_path.glob("*.tmp")), "temp files were left behind"
+
+
+class TestSaveDirtyTracking:
+    """A multi-second background save must not swallow edits made during it."""
+
+    def _win(self, qtbot):
+        from photo_editor.ui.main_window import MainWindow
+        win = MainWindow(dev_mode=True)
+        qtbot.addWidget(win)
+        win._autosave_timer.stop()
+        return win
+
+    def test_edits_during_a_save_are_still_unsaved(self, qtbot, tmp_path):
+        """The document was marked clean when the save finished regardless of
+        what happened meanwhile, so a stroke made during a four-second save
+        was recorded as saved and lost on quit without a prompt."""
+        import numpy as np
+
+        win = self._win(qtbot)
+        try:
+            doc = win._doc
+            layer = doc.layers.active_layer
+            layer.begin_write()
+            layer.pixels[:] = 0.25
+            doc.mark_dirty()
+
+            ctrl = win._document_ctrl
+            token = ctrl.__class__.__module__  # noqa: F841 - import guard
+            from photo_editor.ui.controllers.document_ctrl import (
+                _document_revision,
+            )
+            revision = _document_revision(doc)
+
+            # An edit lands while the save is in flight.
+            layer.begin_write()
+            layer.pixels[:] = 0.75
+
+            ctrl._after_save_succeeded(doc, str(tmp_path / "x.basera"),
+                                       saved_revision=revision)
+            assert doc.dirty, (
+                "an edit made during the save was marked as saved")
+        finally:
+            win._doc.mark_clean()
+
+    def test_an_untouched_document_is_marked_clean(self, qtbot, tmp_path):
+        win = self._win(qtbot)
+        try:
+            from photo_editor.ui.controllers.document_ctrl import (
+                _document_revision,
+            )
+            doc = win._doc
+            doc.mark_dirty()
+            revision = _document_revision(doc)
+            win._document_ctrl._after_save_succeeded(
+                doc, str(tmp_path / "y.basera"), saved_revision=revision)
+            assert not doc.dirty
+        finally:
+            win._doc.mark_clean()

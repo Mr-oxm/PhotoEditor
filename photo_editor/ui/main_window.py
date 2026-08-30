@@ -522,17 +522,27 @@ class MainWindow(QMainWindow):
         if not dlg.exec():
             return
         for entry in dlg.selected_entries():
+            # on_open_basera reports failures with a dialog rather than
+            # raising, so "no exception" does not mean "it opened". Confirm
+            # a new document actually arrived before discarding the file --
+            # it is the only copy of the user's crashed work.
+            before = len(self._document_session or ())
             try:
                 self._document_ctrl.on_open_basera(str(entry.doc_path))
-                if self._doc is not None:
-                    # A recovered document is an unsaved copy: it must not
-                    # silently overwrite the file it was recovered from.
-                    self._doc.file_path = None
-                    self._doc.name = entry.name
-                    self._doc.mark_dirty()
-                entry.discard()
             except Exception:
                 continue
+            opened = len(self._document_session or ()) > before
+            if not opened or self._doc is None:
+                self._status.show_activity(
+                    f"Could not recover \"{entry.name}\" — its autosave has "
+                    f"been kept", 6000)
+                continue
+            # A recovered document is an unsaved copy: it must not silently
+            # overwrite the file it was recovered from.
+            self._doc.file_path = None
+            self._doc.name = entry.name
+            self._doc.mark_dirty()
+            entry.discard()
         if self._doc is not None:
             self._activate_project()
 

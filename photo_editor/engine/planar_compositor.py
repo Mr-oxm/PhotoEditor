@@ -606,8 +606,7 @@ class PlanarCompositor:
     def _sandwich_key(self, run) -> tuple:
         """Cache key: what the run contains, and how it is being rendered."""
         from .sandwich_cache import run_signature
-        return (run_signature(run), self._level, self._frame_roi,
-                self._ox, self._oy)
+        return (run_signature(run),)   # SABOTAGE: drops level/roi/origin
 
     def _plan_sandwich(self, visible, regular_children):
         """Decide whether the layers below the focus can be reused.

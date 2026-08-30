@@ -135,17 +135,30 @@ class AutosaveManager:
         return (directory / f"{stem}{_DOC_SUFFIX}",
                 directory / f"{stem}{_SIDECAR_SUFFIX}")
 
+    @staticmethod
+    def _fingerprint(document) -> tuple:
+        """A value that changes whenever the document's content changes.
+
+        Layer content versions are process-wide monotonic and move on every
+        edit. History *depth* is not usable for this: it stops growing once
+        the byte budget starts evicting states, which on a large project
+        happens within a few strokes -- and autosave would then decide
+        nothing had changed and never fire again for the rest of the
+        session, exactly when it matters most.
+        """
+        versions = [getattr(l, "content_version", 0) for l in document.layers]
+        return (max(versions) if versions else 0, len(list(document.layers)))
+
     def should_save(self, doc_key: str, document) -> bool:
         """True when *document* has unsaved changes worth autosaving.
 
-        Uses the document's history depth as a change fingerprint, so an
-        idle session -- or one where the user only panned and zoomed --
+        An idle session -- or one where the user only panned and zoomed --
         writes nothing.
         """
         if document is None or not getattr(document, "dirty", False):
             return False
         stamp = self._last_saved.get(doc_key)
-        fingerprint = len(getattr(document, "history").states)
+        fingerprint = self._fingerprint(document)
         if stamp is None:
             return True
         last_time, last_fingerprint = stamp
@@ -169,8 +182,7 @@ class AutosaveManager:
             }))
         except Exception:
             return None
-        self._last_saved[doc_key] = (
-            time.time(), len(document.history.states))
+        self._last_saved[doc_key] = (time.time(), self._fingerprint(document))
         self._touch_live()
         return doc_path
 

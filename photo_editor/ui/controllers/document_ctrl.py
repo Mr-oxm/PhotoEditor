@@ -16,6 +16,17 @@ _IMG_FLT = "Images (*.png *.jpg *.jpeg *.webp *.tiff *.tif *.bmp)"
 _BASERA_FLT = "Basera Projects (*.basera)"
 
 
+def _document_revision(doc) -> tuple:
+    """A value that changes whenever the document's content changes.
+
+    Layer content versions are process-wide monotonic and move on every
+    edit, so their maximum is a reliable revision marker. History depth is
+    NOT: it stops growing once the byte budget starts evicting states.
+    """
+    versions = [getattr(l, "content_version", 0) for l in doc.layers]
+    return (max(versions) if versions else 0, len(list(doc.layers)))
+
+
 class DocumentController(ControllerBase):
     """Handles new/open/save/close, tabs, and undo/redo."""
 
@@ -240,6 +251,10 @@ class DocumentController(ControllerBase):
 
         doc = self.doc
         name = Path(path).name
+        # What the document looked like when the save started. Edits made
+        # during a multi-second save must NOT be marked saved when it
+        # finishes, or the user quits without a prompt and loses them.
+        token = _document_revision(doc)
         self.ctx.show_status_message(f"Saving {name}…", 0)
 
         def run() -> str:
@@ -248,7 +263,7 @@ class DocumentController(ControllerBase):
 
         def on_result(_result) -> None:
             self._saving = False
-            self._after_save_succeeded(doc, path)
+            self._after_save_succeeded(doc, path, saved_revision=token)
 
         def on_error(message: str) -> None:
             self._saving = False
@@ -257,12 +272,29 @@ class DocumentController(ControllerBase):
 
         Worker.run_async(run, on_result=on_result, on_error=on_error)
 
-    def _after_save_succeeded(self, doc, path: str) -> None:
-        """UI bookkeeping once a background save has completed."""
+    def _after_save_succeeded(self, doc, path: str,
+                              saved_revision=None) -> None:
+        """UI bookkeeping once a save has completed.
+
+        *saved_revision* is the document's revision when the save started.
+        The document is only marked clean if it has not changed since --
+        otherwise a stroke made during a four-second save would be recorded
+        as saved and lost on quit without a prompt.
+        """
         from ...utils.recent_projects import add_recent_project
 
         doc.file_path = path
-        doc.mark_clean()
+        unchanged = (saved_revision is None
+                     or _document_revision(doc) == saved_revision)
+        if unchanged:
+            doc.mark_clean()
+            # Genuinely on disk: drop the autosave so a later crash does not
+            # offer this work back as if it had never been saved.
+            self._forget_autosave(doc)
+        else:
+            self.ctx.show_status_message(
+                f"Saved {Path(path).name} — later edits are still unsaved",
+                3000)
         self.ctx.set_window_title(f"Basera — {Path(path).name}")
         idx = self._session.current_index()
         if idx >= 0:
@@ -276,7 +308,20 @@ class DocumentController(ControllerBase):
                 self.mw._refresh_recent_projects()
         except Exception:
             pass
-        self.ctx.show_status_message(f"Saved {Path(path).name}", 2000)
+        if unchanged:
+            self.ctx.show_status_message(f"Saved {Path(path).name}", 2000)
+
+    def _forget_autosave(self, doc) -> None:
+        """Drop *doc*'s autosave now that it is on disk."""
+        manager = getattr(self.mw, "_autosave", None)
+        session = getattr(self.mw, "_document_session", None)
+        if manager is None or session is None:
+            return
+        for i in range(len(session)):
+            entry = session.entry_at(i)
+            if entry is not None and entry.document is doc:
+                manager.forget(f"{i}-{id(doc):x}")
+                return
 
     def _save_basera_blocking(self, doc, path: str) -> bool:
         """Save *doc* synchronously and report whether it succeeded.
@@ -288,12 +333,13 @@ class DocumentController(ControllerBase):
         if doc is None:
             return False
         from ...utils.project_io import save_basera_project
+        token = _document_revision(doc)
         try:
             save_basera_project(doc, path)
         except Exception as exc:  # noqa: BLE001
             QMessageBox.warning(self.mw, "Save Error", str(exc))
             return False
-        self._after_save_succeeded(doc, path)
+        self._after_save_succeeded(doc, path, saved_revision=token)
         return True
 
     def on_export(self) -> None:

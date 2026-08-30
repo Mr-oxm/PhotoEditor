@@ -66,8 +66,45 @@ def test_further_edits_trigger_another_autosave():
     mgr = A.AutosaveManager(session_id="s1", min_interval_seconds=0)
     doc = _dirty_doc()
     mgr.maybe_save("d1", doc)
-    doc.save_snapshot("another edit")
+
+    layer = doc.layers.active_layer
+    layer.begin_write()
+    layer.pixels[:] = 0.9
     assert mgr.maybe_save("d1", doc) is not None
+
+
+def test_a_snapshot_without_an_edit_does_not_trigger_an_autosave():
+    """The fingerprint tracks content, not history depth: pushing a state
+    that changes no pixels is not new work worth writing to disk."""
+    mgr = A.AutosaveManager(session_id="s1", min_interval_seconds=0)
+    doc = _dirty_doc()
+    mgr.maybe_save("d1", doc)
+    doc.save_snapshot("no-op")
+    assert mgr.maybe_save("d1", doc) is None
+
+
+def test_autosave_keeps_working_after_history_saturates():
+    """History depth stops growing once the byte budget evicts states. Using
+    it as the change fingerprint silently disabled autosave for the rest of
+    the session -- on a large project, within a few strokes."""
+    doc = _dirty_doc()
+    doc.history._budget = 1        # force eviction on every push
+    mgr = A.AutosaveManager(session_id="s1", min_interval_seconds=0)
+
+    saved = 0
+    for i in range(6):
+        doc.save_snapshot(f"edit{i}")
+        layer = doc.layers.active_layer
+        layer.begin_write()
+        layer.pixels[:] = 0.1 * (i + 1)
+        doc.mark_dirty()
+        if mgr.maybe_save("d1", doc) is not None:
+            saved += 1
+
+    assert len(doc.history.states) <= 3, "history did not actually saturate"
+    assert saved >= 5, (
+        f"autosave fired {saved}/6 times once history saturated; it must "
+        "keep tracking edits after the state count stops growing")
 
 
 def test_minimum_interval_is_respected():
@@ -272,4 +309,52 @@ def test_panel_refresh_does_not_recreate_the_autosave_manager(qtbot):
             "panel refresh leaked session marker files")
     finally:
         win._autosave_timer.stop()
+        win._doc.mark_clean()
+
+
+def test_failed_recovery_keeps_the_autosave_file(qtbot, tmp_path):
+    """on_open_basera reports failures with a dialog rather than raising, so
+    'no exception' did not mean 'it opened' -- and the entry was discarded,
+    destroying the only copy of the user's crashed work."""
+    from photo_editor.ui.main_window import MainWindow
+
+    mgr = A.AutosaveManager(session_id="crashed", min_interval_seconds=0)
+    mgr.save("d1", _dirty_doc("Crashed Work"))
+    (A.recovery_dir() / f"crashed{A._LIVE_SUFFIX}").unlink()
+
+    entry = A.find_recoverable()[0]
+    # Corrupt it so the load fails the way a truncated autosave would.
+    entry.doc_path.write_bytes(b"not a zip archive at all")
+
+    win = MainWindow(dev_mode=True)
+    qtbot.addWidget(win)
+    win._autosave_timer.stop()
+    try:
+        # on_open_basera reports the failure with a modal QMessageBox, which
+        # blocks forever without a user. Suppress it for the test.
+        from PySide6.QtWidgets import QMessageBox
+        original_warning = QMessageBox.warning
+        QMessageBox.warning = staticmethod(lambda *a, **k: None)
+
+        class _Dlg:
+            @staticmethod
+            def exec():
+                return True
+
+            @staticmethod
+            def selected_entries():
+                return [entry]
+
+        import photo_editor.ui.dialogs.recovery_dialog as rd
+        original = rd.RecoveryDialog
+        rd.RecoveryDialog = lambda *a, **k: _Dlg()
+        try:
+            win.offer_recovery()
+        finally:
+            rd.RecoveryDialog = original
+            QMessageBox.warning = original_warning
+
+        assert entry.doc_path.exists(), (
+            "a recovery entry that failed to open was discarded")
+    finally:
         win._doc.mark_clean()
