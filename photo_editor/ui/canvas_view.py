@@ -10,11 +10,12 @@ from __future__ import annotations
 
 import math
 
+import cv2
 import numpy as np
 from PySide6.QtCore import Qt, QPointF, QRectF, QTimer, Signal
 from PySide6.QtGui import (
     QColor, QCursor, QImage, QKeyEvent, QMouseEvent,
-    QPainter, QPainterPath, QPen, QPixmap, QWheelEvent,
+    QPainter, QPainterPath, QPen, QPixmap, QPolygonF, QWheelEvent,
 )
 from PySide6.QtWidgets import QApplication, QWidget
 
@@ -73,6 +74,7 @@ class CanvasView(_BASE_CLASS):
         # Selection overlay — marching ants
         self._sel_mask: np.ndarray | None = None
         self._sel_contours: list | None = None  # list of QPolygonF for marching ants
+        self._sel_version: int | None = None    # content id of _sel_contours
         self._march_offset: int = 0               # animated dash offset
         self._march_timer = QTimer(self)
         self._march_timer.setInterval(100)         # ~10 fps animation
@@ -216,22 +218,32 @@ class CanvasView(_BASE_CLASS):
         self._pixmap = QPixmap.fromImage(qimg)
         self.update()
 
-    def set_selection_mask(self, mask: np.ndarray | None) -> None:
-        """Set the selection mask for marching-ants overlay rendering."""
+    def set_selection_mask(self, mask: np.ndarray | None,
+                           version: int | None = None) -> None:
+        """Set the selection mask for marching-ants overlay rendering.
+
+        *version* identifies the selection's content. When it is unchanged
+        the contours are reused: tracing them costs a full-document uint8
+        conversion, a cv2.findContours pass and one Python-level QPointF per
+        contour point, and it was being redone on every rendered frame.
+        """
         if mask is None:
             if self._sel_mask is None:
                 return  # already cleared
             self._sel_mask = None
             self._sel_contours = None
+            self._sel_version = None
             self._march_timer.stop()
             self.update()
             return
+        if version is not None and version == self._sel_version:
+            return  # unchanged since the contours were built
+        self._sel_version = version
         self._sel_mask = mask
         # Extract contours from the binary mask for marching ants
-        import cv2
         mask_u8 = (np.clip(mask, 0, 1) * 255).astype(np.uint8)
-        contours, _ = cv2.findContours(mask_u8, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-        from PySide6.QtGui import QPolygonF
+        contours, _ = cv2.findContours(mask_u8, cv2.RETR_LIST,
+                                       cv2.CHAIN_APPROX_SIMPLE)
         polys = []
         for c in contours:
             if len(c) < 2:

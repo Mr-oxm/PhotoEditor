@@ -170,7 +170,7 @@ class CanvasController(ControllerBase):
             dy1 = dy0 + (sy1 - sy0)
             if sx1 > sx0 and sy1 > sy0:
                 new_mask[dy0:dy1, dx0:dx1] = orig[sy0:sy1, sx0:sx1]
-            mw._doc.selection._mask = new_mask
+            mw._doc.selection._set_mask(new_mask)
             self.signals.selection_overlay_requested.emit()
             self.signals.canvas_update_requested.emit()
             return

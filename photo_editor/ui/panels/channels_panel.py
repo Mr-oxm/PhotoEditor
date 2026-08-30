@@ -137,6 +137,9 @@ class ChannelsPanel(QWidget):
 
         self._doc: Document | None = None
         self._block_signals = False
+        # Content key of what is currently displayed, so a
+        # refresh with unchanged state can return immediately.
+        self._shown_key = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
@@ -162,9 +165,20 @@ class ChannelsPanel(QWidget):
         self._doc = doc
         if not doc or not doc.layers.active_layer:
             self.setEnabled(False)
+            self._shown_key = None
             return
 
         self.setEnabled(True)
+        # Skip entirely when nothing this panel displays has changed. It used
+        # to re-derive four channel previews -- and, for a group, re-composite
+        # the whole group -- on every rendered frame.
+        layer = doc.layers.active_layer
+        key = (layer.id, layer.content_version,
+               layer.channel_r, layer.channel_g, layer.channel_b, layer.channel_a,
+               len(doc.layers.layers))
+        if key == self._shown_key:
+            return
+        self._shown_key = key
         self._update_ui_values()
 
     def _update_ui_values(self):
@@ -183,8 +197,7 @@ class ChannelsPanel(QWidget):
         pixels = None
         if layer.layer_type == LayerType.GROUP:
             from ...engine.compositor import Compositor
-            compositor = Compositor()
-            pixels = compositor.composite_group_tight(layer, self._doc.layers)
+            pixels = Compositor().composite_group_tight(layer, self._doc.layers)
         else:
             pixels = layer.pixels
 

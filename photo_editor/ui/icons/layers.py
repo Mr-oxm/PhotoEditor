@@ -10,6 +10,29 @@ from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPainterPath, QPen, QP
 from ..theme import ThemeManager
 
 
+# Icons are rebuilt from scratch on every layer row of every panel refresh --
+# a QPixmap, a QPainter and an antialiased QPainterPath each time, twenty
+# times per refresh for a twenty-layer document. They depend only on their
+# boolean state and the active palette, so they are cached on both.
+_ICON_CACHE: dict[tuple, QIcon] = {}
+
+
+def _cached_icon(kind: str, state) -> QIcon | None:
+    return _ICON_CACHE.get(
+        (kind, state, ThemeManager.instance().active_theme_name))
+
+
+def _store_icon(kind: str, state, icon: QIcon) -> QIcon:
+    _ICON_CACHE[(kind, state,
+                 ThemeManager.instance().active_theme_name)] = icon
+    return icon
+
+
+def clear_icon_cache() -> None:
+    """Drop cached icons (the palette they were drawn with has changed)."""
+    _ICON_CACHE.clear()
+
+
 def _draw_icon(size: int, draw_fn) -> QIcon:
     pixmap = QPixmap(size, size)
     pixmap.fill(Qt.GlobalColor.transparent)
@@ -25,6 +48,10 @@ def _tb_icon(draw_fn, size: int = 16) -> QIcon:
 
 
 def icon_eye(visible: bool) -> QIcon:
+    cached = _cached_icon("eye", visible)
+    if cached is not None:
+        return cached
+
     def _draw(p: QPainter, s: int):
         cx, cy = s / 2, s / 2
         palette = ThemeManager.instance().active_palette
@@ -46,10 +73,14 @@ def icon_eye(visible: bool) -> QIcon:
             p.setPen(QPen(QColor(170, 70, 70), 1.5))
             p.drawLine(QPointF(4, s - 4), QPointF(s - 4, 4))
 
-    return _draw_icon(18, _draw)
+    return _store_icon("eye", visible, _draw_icon(18, _draw))
 
 
 def icon_lock(locked: bool) -> QIcon:
+    cached = _cached_icon("lock", locked)
+    if cached is not None:
+        return cached
+
     def _draw(p: QPainter, s: int):
         palette = ThemeManager.instance().active_palette
         col_active = palette["fg"]
@@ -71,19 +102,22 @@ def icon_lock(locked: bool) -> QIcon:
         shackle.lineTo(sx + sw, by if locked else by - 5)
         p.drawPath(shackle)
 
-    return _draw_icon(18, _draw)
+    return _store_icon("lock", locked, _draw_icon(18, _draw))
 
 
 def icon_mask(has_mask: bool) -> QIcon:
+    cached = _cached_icon("mask", has_mask)
+    if cached is not None:
+        return cached
     if not has_mask:
-        return QIcon(QPixmap(18, 18))
+        return _store_icon("mask", False, QIcon(QPixmap(18, 18)))
 
     def _draw(p: QPainter, s: int):
         p.setPen(QPen(QColor(180, 180, 180), 1.2))
         p.setBrush(QColor(180, 180, 180, 50))
         p.drawEllipse(QRectF(2, 2, s - 4, s - 4))
 
-    return _draw_icon(18, _draw)
+    return _store_icon("mask", True, _draw_icon(18, _draw))
 
 
 def ico_new_layer() -> QIcon:

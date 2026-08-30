@@ -274,7 +274,7 @@ def _load_v3(source: Path) -> Document:
         # Restore selection mask
         if manifest.get("has_selection"):
             try:
-                document.selection._mask = _read_npy(zf, _SEL_ENTRY)
+                document.selection._set_mask(_read_npy(zf, _SEL_ENTRY))
             except (KeyError, Exception):
                 pass
 

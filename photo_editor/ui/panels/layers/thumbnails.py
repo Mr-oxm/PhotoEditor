@@ -16,15 +16,34 @@ from .base import THUMB_SIZE
 _THUMB_CHECKER: QPixmap | None = None
 
 # ---- LRU thumbnail cache ---------------------------------------------------
-# Key: layer.id, Value: QPixmap
-# Thumbnails are only regenerated when explicitly invalidated.
+# Key: (layer id, content version), Value: QPixmap
+#
+# The version is part of the key deliberately. Keying on layer.id alone meant
+# a thumbnail was generated once and never again: invalidate_thumbnail()
+# existed but had no callers anywhere, so every layer's thumbnail silently
+# went stale the moment it was painted on. Including the content version
+# makes invalidation automatic and impossible to forget.
 _THUMB_CACHE_MAX = 256
-_thumb_cache: OrderedDict[str, QPixmap] = OrderedDict()
+_thumb_cache: OrderedDict[tuple, QPixmap] = OrderedDict()
+
+
+def _layer_key(layer) -> tuple:
+    return (layer.id, getattr(layer, "content_version", 0))
+
+
+def _group_key(document, group) -> tuple:
+    """Groups depend on their children, so fold their versions in too."""
+    versions = tuple(
+        (l.id, getattr(l, "content_version", 0), l.visible, l.opacity)
+        for l in document.layers if l.parent_id == group.id
+    )
+    return (group.id, getattr(group, "content_version", 0), versions)
 
 
 def invalidate_thumbnail(layer_id: str) -> None:
-    """Remove a single thumbnail from the cache (e.g. after pixel edits)."""
-    _thumb_cache.pop(layer_id, None)
+    """Drop every cached thumbnail for *layer_id*, at any version."""
+    for key in [k for k in _thumb_cache if k[0] == layer_id]:
+        _thumb_cache.pop(key, None)
 
 
 def invalidate_all_thumbnails() -> None:
@@ -32,9 +51,9 @@ def invalidate_all_thumbnails() -> None:
     _thumb_cache.clear()
 
 
-def _cache_put(layer_id: str, pm: QPixmap) -> None:
-    _thumb_cache[layer_id] = pm
-    _thumb_cache.move_to_end(layer_id)
+def _cache_put(key: tuple, pm: QPixmap) -> None:
+    _thumb_cache[key] = pm
+    _thumb_cache.move_to_end(key)
     while len(_thumb_cache) > _THUMB_CACHE_MAX:
         _thumb_cache.popitem(last=False)
 
@@ -85,9 +104,10 @@ def pixels_to_thumbnail_pixmap(px: np.ndarray, size: int = THUMB_SIZE) -> QPixma
 
 def make_thumbnail(layer, size: int = THUMB_SIZE) -> QPixmap:
     """Generate (or return cached) a small QPixmap thumbnail for *layer*."""
-    cached = _thumb_cache.get(layer.id)
+    key = _layer_key(layer)
+    cached = _thumb_cache.get(key)
     if cached is not None:
-        _thumb_cache.move_to_end(layer.id)
+        _thumb_cache.move_to_end(key)
         return cached
     pm = QPixmap(thumb_checker(size))
     try:
@@ -96,24 +116,24 @@ def make_thumbnail(layer, size: int = THUMB_SIZE) -> QPixmap:
             pm = pixels_to_thumbnail_pixmap(px, size)
     except Exception:
         pass
-    _cache_put(layer.id, pm)
+    _cache_put(key, pm)
     return pm
 
 
 def make_group_thumbnail(document: Document, group, size: int = THUMB_SIZE) -> QPixmap:
     """Generate (or return cached) a thumbnail for a group layer."""
-    cached = _thumb_cache.get(group.id)
+    key = _group_key(document, group)
+    cached = _thumb_cache.get(key)
     if cached is not None:
-        _thumb_cache.move_to_end(group.id)
+        _thumb_cache.move_to_end(key)
         return cached
     pm = QPixmap(thumb_checker(size))
     try:
         from ....engine.compositor import Compositor
-        compositor = Compositor()
-        px = compositor.composite_group_tight(group, document.layers)
+        px = Compositor().composite_group_tight(group, document.layers)
         if px is not None and px.size > 0:
             pm = pixels_to_thumbnail_pixmap(px, size)
     except Exception:
         pass
-    _cache_put(group.id, pm)
+    _cache_put(key, pm)
     return pm

@@ -550,14 +550,17 @@ class MainWindow(QMainWindow):
             src_rect=src_rect,
         )
         self._sync_canvas_scrollbars()
+        # Overlays track the frame and are cheap now that the selection
+        # caches its contours and bounds.
         self._selection_ctrl.update_selection_overlay()
         self._transform_ctrl.update_transform_box()
-        self._transform_panel.refresh(self._doc)
-        self._channels_panel.refresh(self._doc)
-        self._view_ctrl.update_rulers()
+        # The transform, channels and history panels depend on document
+        # state, not on the rendered pixels, so refreshing them once per
+        # frame was pure waste -- the channels panel even re-composited the
+        # active group each time. They are coalesced to ~5 fps instead.
+        self._schedule_panel_refresh()
         if full_refresh:
             self._layers_panel.refresh(self._doc)
-            self._history_panel.refresh(self._doc.history)
 
     def _on_render_error(self, message: str) -> None:
         """Render worker failed — fallback to sync render."""
@@ -636,6 +639,7 @@ class MainWindow(QMainWindow):
             self._transform_panel.refresh(self._doc)
             self._channels_panel.refresh(self._doc)
             self._history_panel.refresh(self._doc.history)
+            self._view_ctrl.update_rulers()
 
     # ---- Key event handling -------------------------------------------------
 

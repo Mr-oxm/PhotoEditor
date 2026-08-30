@@ -6,6 +6,8 @@ from PySide6.QtCore import QPointF
 
 from .base import ControllerBase
 from ..services.guide_ui_state import apply_guides, apply_preview_guide
+from ..widgets.rulers import RULER_SIZE
+from ...core.enums import LayerType
 
 
 class ViewController(ControllerBase):
@@ -175,7 +177,6 @@ class ViewController(ControllerBase):
         v_origin = dr.top()
         mw._v_ruler.set_view_params(v_zoom, v_origin, dh)
 
-        from ..widgets.rulers import RULER_SIZE
         mw._h_ruler.set_perp_view_params(v_zoom, v_origin + RULER_SIZE, dh)
         mw._v_ruler.set_perp_view_params(h_zoom, h_origin + RULER_SIZE, dw)
 
@@ -186,11 +187,13 @@ class ViewController(ControllerBase):
             mw._h_ruler.set_unit(unit, dpi)
             mw._v_ruler.set_unit(unit, dpi)
 
-        from ...core.enums import LayerType
         layer = mw._doc.layers.active_layer if mw._doc else None
         if layer and layer.layer_type not in (LayerType.GROUP, LayerType.MASK):
             lx, ly = layer.position
-            lh, lw = layer.pixels.shape[:2]
+            # layer.width/height, not layer.pixels.shape: the pixels property
+            # triggers a full non-destructive-transform recompute when the
+            # layer is dirty, and this runs on the view-change path.
+            lw, lh = layer.width, layer.height
             mw._h_ruler.set_layer_bounds(float(lx), float(lx + lw))
             mw._v_ruler.set_layer_bounds(float(ly), float(ly + lh))
         else:

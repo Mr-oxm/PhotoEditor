@@ -686,9 +686,9 @@ class Document:
         # Restore selection mask
         sel_key = "__selection_mask__"
         if sel_key in state.layer_data:
-            self.selection._mask = state.layer_data[sel_key].copy()
+            self.selection._set_mask(state.layer_data[sel_key].copy())
         else:
-            self.selection._mask = None
+            self.selection._set_mask(None)
         self._dirty = True
 
     # ---- Canvas ops ---------------------------------------------------------
