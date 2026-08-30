@@ -3,7 +3,7 @@
 import os
 import sys
 
-from PySide6.QtCore import QEventLoop, QTimer, Qt
+from PySide6.QtCore import QTimer, Qt
 from PySide6.QtGui import QGuiApplication, QIcon, QImage, QPixmap
 from PySide6.QtWidgets import QApplication, QSplashScreen
 
@@ -40,7 +40,15 @@ def _blend_cool_desaturated(image: QImage, amount: float) -> QImage:
 
 
 def _show_animated_splash(app: QApplication, splash_path: str) -> QSplashScreen | None:
-    """Show the splash screen and animate it from grayscale to colour."""
+    """Show the splash screen, animating it from grey to colour.
+
+    The animation runs on a timer alongside window construction rather than
+    blocking in a nested event loop first. Blocking cost a *fixed* one
+    second of startup -- more than half of it -- and, worse, it was time in
+    which nothing else happened: the window was not built until the last
+    frame had been drawn. Now the two overlap, so the splash is a view of
+    real startup progress rather than a delay pretending to be one.
+    """
     if not os.path.exists(splash_path):
         return None
 
@@ -66,21 +74,20 @@ def _show_animated_splash(app: QApplication, splash_path: str) -> QSplashScreen 
     app.processEvents()
 
     frame_count = 10
-    frame_interval_ms = 100
-    loop = QEventLoop()
+    frame_interval_ms = 40
 
     def update_frame(frame: int) -> None:
+        # The splash may already have been finished by the window appearing;
+        # setting a pixmap on a closed splash is harmless but pointless.
+        if not splash.isVisible():
+            return
         splash.setPixmap(
             QPixmap.fromImage(_blend_cool_desaturated(base_image, frame / frame_count))
         )
-        app.processEvents()
-        if frame >= frame_count:
-            loop.quit()
 
     for frame in range(1, frame_count + 1):
-        QTimer.singleShot(frame * frame_interval_ms, lambda f=frame: update_frame(f))
-
-    loop.exec()
+        QTimer.singleShot(frame * frame_interval_ms,
+                          lambda f=frame: update_frame(f))
     return splash
 
 

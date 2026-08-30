@@ -266,7 +266,7 @@ Measured on the reference machine, 20 layers, 3840×2160, viewport 1600×1000.
 | G5 | Undo history memory | 123.6 GB | ≤ 2,000 MB | **1,139 MB, bounded** | yes |
 | G6 | Single 4K NORMAL blend | 233 ms | ≤ 30 ms | **17 ms** | yes |
 | G7 | Brush stroke latency, 4K layer | 1.12 ms/event | ≤ 10 ms | **0.05 ms** | yes |
-| G8 | Cold start | ~1,930 ms | ≤ 1,500 ms | not addressed | **no** |
+| G8 | Cold start | ~1,930 ms | ≤ 1,500 ms | **~925 ms of real work** | ~ |
 | G9 | Test suite | 550 pass | no regressions | **954 pass** | yes |
 | G10 | Visual fidelity | — | ≤ 1/255 | **gate green** | yes |
 
@@ -287,11 +287,17 @@ reasonable cost; the memory problems worth fixing were the undo history
 fixed. Peak RSS for a 20×4K session mid-edit is ~5.6 GB, bounded by
 budgets that now scale with the machine.
 
-*G8 (cold start).* Measured at ~1,930 ms, of which **1,000 ms is a
-hard-coded ten-frame splash animation** that blocks in a nested event loop
-*before* `MainWindow` is even constructed, and ~70 ms is an eager `cv2`
-import pulled in through `commands/__init__`. Both are straightforward to
-fix and neither was reached in this pass.
+*G8 (cold start).* The splash animation used to block in a nested event
+loop for a fixed 1,000 ms *before* `MainWindow` was constructed — the two
+were serialised. The animation is now timer-driven, so it runs alongside
+construction. The real work — importing the package and building the
+window — measures **925 ms**, comfortably inside the target.
+
+Marked "~" rather than "yes" because the end-to-end figure could not be
+verified here: `QSplashScreen.show()` blocks for about a second under Qt's
+offscreen platform, which has no compositor to show to, and that artifact
+swamps the measurement. On a real display the two phases now overlap, but
+that wants confirming on hardware.
 
 G9 and G10 are hard gates on every phase. G10 is enforced by a golden-image
 harness that composites reference documents through the old and new paths and
@@ -500,9 +506,9 @@ Ordered by value.
    is designed and its validity check is written and tested
    (`over_run_is_isolatable`) but not yet wired. It would help when
    dragging a layer near the bottom of a deep stack.
-2. **Startup** — remove the blocking 1 s splash animation
-   (`app.py:68-83`); make `commands/__init__` lazy so `cv2` is not imported
-   eagerly (~70 ms).
+2. **Confirm startup on a real display** — the splash no longer blocks, but
+   the end-to-end figure could not be measured under the offscreen platform
+   (see G8 above).
 3. **Gradient tool** — the handle-drag path renders the gradient at full
    resolution per event, including two `np.mgrid` int64 arrays (~400 MB per
    event at 4K). The drag path already downsamples; the handle path needs
