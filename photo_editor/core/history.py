@@ -28,9 +28,7 @@ from typing import Any
 
 import numpy as np
 
-# Default ceiling for retained undo data. Deliberately expressed in bytes:
-# "50 states" means 6 MB for a small document and 124 GB for a large one.
-DEFAULT_BUDGET_BYTES = 1 << 30  # 1 GiB
+from .memory_budget import history_budget
 
 
 @dataclass
@@ -59,8 +57,13 @@ class HistoryManager:
     def __init__(
         self,
         max_states: int = 200,
-        budget_bytes: int = DEFAULT_BUDGET_BYTES,
+        budget_bytes: int | None = None,
     ) -> None:
+        # Bounded by bytes, not by a state count: "50 states" means 6 MB for
+        # a small document and 124 GB for a 20-layer 4K one. The default
+        # scales with the machine.
+        if budget_bytes is None:
+            budget_bytes = history_budget()
         self._states: list[HistoryState] = []
         self._index: int = -1
         self._max = max_states

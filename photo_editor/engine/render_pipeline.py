@@ -18,6 +18,7 @@ import numpy as np
 
 from ..blending.planar import to_interleaved
 from ..core.document import Document
+from ..core.memory_budget import render_cache_budget
 from .layer_cache import LayerRasterCache
 from .parallel_compositor import ParallelCompositor
 from .tile_cache import TileCache
@@ -26,17 +27,18 @@ from .tile_cache import TileCache
 class RenderPipeline:
     """Full pipeline: layer compositing -> adjustment layers -> output."""
 
-    # Twenty 4K layers prepared at level 1 (1920x1080) need ~663 MB. A
-    # smaller budget does not merely cache less -- it thrashes, re-preparing
-    # every layer on every frame, which measured 421 ms/frame against 35 ms
-    # with the working set resident.
-    DEFAULT_CACHE_MB = 1280
-
     def __init__(self, cache_budget_mb: int | None = None,
                  max_workers: int | None = None) -> None:
+        # Twenty 4K layers prepared at level 1 (1920x1080) need ~663 MB.
+        # Undersizing this does not merely cache less -- it thrashes,
+        # re-preparing every layer on every frame, which measured
+        # 421 ms/frame against 35 ms with the working set resident. The
+        # default therefore scales with the machine.
         if cache_budget_mb is None:
-            cache_budget_mb = self.DEFAULT_CACHE_MB
-        self._layer_cache = LayerRasterCache(budget_bytes=cache_budget_mb << 20)
+            budget = render_cache_budget()
+        else:
+            budget = cache_budget_mb << 20
+        self._layer_cache = LayerRasterCache(budget_bytes=budget)
         self._compositor = ParallelCompositor(
             cache=self._layer_cache, max_workers=max_workers)
         self._tile_cache = TileCache(tile_size=256)
