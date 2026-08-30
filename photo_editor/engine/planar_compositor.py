@@ -41,6 +41,53 @@ class PlanarCompositor:
     def __init__(self, cache: "LayerRasterCache | None" = None) -> None:
         self._scratch = PlanarScratch(max_per_shape=3)
         self._cache = cache
+        # Origin of the band currently being composited. Band-parallel
+        # rendering composites horizontal slices of the document
+        # independently; each slice is a normal composite whose canvas is
+        # band-sized and whose layer positions are shifted by -origin.
+        self._ox = 0
+        self._oy = 0
+        # Mip level for this composite. Level L renders at 1 / 2**L scale;
+        # level 0 is full resolution and is what export uses.
+        self._level = 0
+        self._scale = 1.0
+
+    def _pos(self, position: tuple[int, int]) -> tuple[int, int]:
+        """Translate a document-space position into scaled band space."""
+        if self._scale != 1.0:
+            position = (int(round(position[0] * self._scale)),
+                        int(round(position[1] * self._scale)))
+        if self._ox == 0 and self._oy == 0:
+            return position
+        return (position[0] - self._ox, position[1] - self._oy)
+
+    def _downscale(self, arr: np.ndarray) -> np.ndarray:
+        """Downscale an interleaved image (or 2-D mask) to the active level.
+
+        INTER_AREA is the right filter for minification -- it averages the
+        source pixels covered by each destination pixel, which is what a mip
+        level should be, and it avoids the aliasing a naive resize gives on
+        detailed photographic content.
+        """
+        if self._scale == 1.0:
+            return arr
+        h, w = arr.shape[:2]
+        nw = max(1, int(round(w * self._scale)))
+        nh = max(1, int(round(h * self._scale)))
+        if nw == w and nh == h:
+            return arr
+        try:
+            import cv2
+            return cv2.resize(arr, (nw, nh), interpolation=cv2.INTER_AREA)
+        except ImportError:
+            ys = (np.arange(nh) * (h / nh)).astype(np.int32)
+            xs = (np.arange(nw) * (w / nw)).astype(np.int32)
+            return arr[ys][:, xs]
+
+    def _scaled_mask(self, mask: np.ndarray | None) -> np.ndarray | None:
+        if mask is None or self._scale == 1.0:
+            return mask
+        return self._downscale(mask)
 
     # ------------------------------------------------------------------
     # Padding / adjustment helpers (unchanged semantics)
@@ -93,7 +140,7 @@ class PlanarCompositor:
         return res
 
     def _get_effective_mask(self, layer: Layer, stack: LayerStack) -> np.ndarray | None:
-        return MaskManager.get_combined_mask(layer, stack)
+        return self._scaled_mask(MaskManager.get_combined_mask(layer, stack))
 
     # ------------------------------------------------------------------
     # Per-layer pixel preparation
@@ -107,26 +154,31 @@ class PlanarCompositor:
         Applies styles, channel toggles and scoped adjustment/filter
         children, then converts to planar. Cached when a cache is attached.
         """
+        kids = adj_children.get(layer.id)
         if self._cache is not None:
-            cached = self._cache.get_prepared(layer, adj_children.get(layer.id))
+            cached = self._cache.get_prepared(layer, kids, self._level)
             if cached is not None:
                 return cached
 
+        # Styles and filters are applied at full resolution and only then
+        # downscaled. Scaling their *parameters* instead would be cheaper
+        # but visibly wrong -- a drop shadow's offset and a blur's radius
+        # do not survive naive scaling. The full-res work is cached, so it
+        # happens once per edit rather than once per frame.
         pixels = layer.pixels
         if layer.styles:
             pixels = StyleEngine.apply_styles(pixels, layer.styles)
         pixels = self._apply_channels(pixels, layer)
         blend_pos = layer.position
-        kids = adj_children.get(layer.id)
         if kids:
             pixels, pad = self._apply_filters_padded(pixels, kids)
             if pad > 0:
                 blend_pos = (layer.position[0] - pad, layer.position[1] - pad)
 
-        planar = to_planar(pixels)
+        planar = to_planar(self._downscale(pixels))
         result = (planar, blend_pos)
         if self._cache is not None:
-            self._cache.put_prepared(layer, kids, result)
+            self._cache.put_prepared(layer, kids, result, self._level)
         return result
 
     # ------------------------------------------------------------------
@@ -166,7 +218,8 @@ class PlanarCompositor:
         combined = self._get_effective_mask(layer, stack)
         if combined is None:
             return None
-        return self._place_mask_array(combined, layer.position, cw, ch)
+        return self._place_mask_array(
+            combined, self._pos(layer.position), cw, ch)
 
     # ------------------------------------------------------------------
     # Adjustment application on a canvas-sized planar buffer
@@ -184,9 +237,32 @@ class PlanarCompositor:
     # Main composite
     # ------------------------------------------------------------------
 
-    def composite(self, stack: LayerStack, width: int, height: int) -> np.ndarray:
-        """Composite *stack* into a planar (4, height, width) float32 buffer."""
-        canvas = np.zeros((4, height, width), dtype=np.float32)
+    def composite(self, stack: LayerStack, width: int, height: int,
+                  origin: tuple[int, int] = (0, 0),
+                  out: np.ndarray | None = None,
+                  level: int = 0) -> np.ndarray:
+        """Composite *stack* into a planar (4, height, width) float32 buffer.
+
+        *width* and *height* are the canvas size in *output* pixels. When
+        *level* is non-zero that is the scaled size, not the document size.
+
+        *origin* shifts the composited window within the output, so a
+        caller can render a horizontal band (or any sub-rectangle) by
+        passing its top-left corner and a matching canvas size. *out*, when
+        given, is written in place instead of allocating.
+        """
+        self._ox, self._oy = origin
+        self._level = level
+        self._scale = 1.0 / (1 << level)
+        # Root-level adjustment layers rebind `canvas` to the adjusted
+        # result, so the buffer we finish with may not be the one we were
+        # handed. Remember the caller's buffer and copy back at the end.
+        out_buf = out
+        if out is not None:
+            canvas = out
+            canvas.fill(0)
+        else:
+            canvas = np.zeros((4, height, width), dtype=np.float32)
         layers = list(stack)
 
         mask_layer_ids: set[str] = set()
@@ -258,9 +334,9 @@ class PlanarCompositor:
 
             # --- Standalone mask: attenuates the canvas built so far ----
             if layer.layer_type == LayerType.MASK and layer.id in standalone_mask_ids:
-                gray = layer.get_mask_grayscale()
+                gray = self._scaled_mask(layer.get_mask_grayscale())
                 placed_gray = self._place_mask_array(
-                    gray, layer.position, width, height)
+                    gray, self._pos(layer.position), width, height)
                 if layer.ex_parent_id:
                     # Detached mask -- alpha only.
                     canvas[3] *= placed_gray
@@ -291,7 +367,7 @@ class PlanarCompositor:
                 group_mask = self._get_effective_mask(layer, stack)
                 if group_mask is not None:
                     placed_mask = self._place_mask_array(
-                        group_mask, layer.position, width, height)
+                        group_mask, self._pos(layer.position), width, height)
                     group_img[3] *= placed_mask
                 blend_planar_region(canvas, group_img, (0, 0),
                                     layer.blend_mode, layer.opacity)
@@ -306,7 +382,8 @@ class PlanarCompositor:
                 rc.clips_parent for rc in regular_children.get(layer.id, ()))
 
             if layer.clipping_mask and prev_img is not None:
-                placed = self._place_planar(pixels, blend_pos, width, height)
+                placed = self._place_planar(
+                    pixels, self._pos(blend_pos), width, height)
                 borrowed.append(placed)
                 placed[3] *= prev_img[3]
                 placed_mask = (
@@ -320,13 +397,14 @@ class PlanarCompositor:
 
             elif _has_clip_child:
                 parent_placed = self._place_planar(
-                    pixels, blend_pos, width, height)
+                    pixels, self._pos(blend_pos), width, height)
                 borrowed.append(parent_placed)
                 for child in regular_children[layer.id]:
                     if not child.clips_parent:
                         continue
                     c_pix, c_pos = self._prepare_layer(child, adj_children)
-                    c_placed = self._place_planar(c_pix, c_pos, width, height)
+                    c_placed = self._place_planar(
+                        c_pix, self._pos(c_pos), width, height)
                     parent_placed[3] *= c_placed[3]
                     self._scratch.release(c_placed)
                 placed_mask = (
@@ -345,12 +423,12 @@ class PlanarCompositor:
                 prev_img = parent_placed
 
             else:
-                blend_planar_region(canvas, pixels, blend_pos,
+                blend_planar_region(canvas, pixels, self._pos(blend_pos),
                                     layer.blend_mode, layer.opacity, mask)
                 release_prev(prev_img)
                 if layer.id in needs_placed or layer.id in regular_children:
                     prev_img = self._place_planar(
-                        pixels, blend_pos, width, height)
+                        pixels, self._pos(blend_pos), width, height)
                     borrowed.append(prev_img)
                 else:
                     prev_img = None
@@ -369,6 +447,9 @@ class PlanarCompositor:
         release_prev(prev_img)
         for buf in borrowed:
             self._scratch.release(buf)
+        if out_buf is not None and canvas is not out_buf:
+            np.copyto(out_buf, canvas)
+            canvas = out_buf
         return canvas
 
     def _blend_clipped_child(
@@ -395,6 +476,8 @@ class PlanarCompositor:
     def _composite_group(
         self, group: Layer, stack: LayerStack, w: int, h: int,
     ) -> np.ndarray:
+        # Runs inside the caller's band: self._ox/_oy are already set, and
+        # every placement below goes through _pos().
         canvas = np.zeros((4, h, w), dtype=np.float32)
         mask_ids: set[str] = set()
         group_child_ids: set[str] = set()
@@ -442,12 +525,14 @@ class PlanarCompositor:
                 rc.clips_parent for rc in regular_children.get(layer.id, ()))
 
             if _has_clip_child:
-                parent_placed = self._place_planar(pixels, blend_pos, w, h)
+                parent_placed = self._place_planar(
+                    pixels, self._pos(blend_pos), w, h)
                 for child in regular_children[layer.id]:
                     if not child.clips_parent:
                         continue
                     c_pix, c_pos = self._prepare_layer(child, adj_children)
-                    c_placed = self._place_planar(c_pix, c_pos, w, h)
+                    c_placed = self._place_planar(
+                        c_pix, self._pos(c_pos), w, h)
                     parent_placed[3] *= c_placed[3]
                     self._scratch.release(c_placed)
                 placed_mask = (
@@ -464,10 +549,11 @@ class PlanarCompositor:
                         parent_placed, w, h)
                 self._scratch.release(parent_placed)
             else:
-                blend_planar_region(canvas, pixels, blend_pos,
+                blend_planar_region(canvas, pixels, self._pos(blend_pos),
                                     layer.blend_mode, layer.opacity, mask)
                 if layer.id in regular_children:
-                    parent_placed = self._place_planar(pixels, blend_pos, w, h)
+                    parent_placed = self._place_planar(
+                        pixels, self._pos(blend_pos), w, h)
                     for child in regular_children[layer.id]:
                         self._blend_clipped_child(
                             canvas, child, stack, adj_children,

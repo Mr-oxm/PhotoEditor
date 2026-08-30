@@ -19,40 +19,55 @@ import numpy as np
 from ..blending.planar import to_interleaved
 from ..core.document import Document
 from .layer_cache import LayerRasterCache
-from .planar_compositor import PlanarCompositor
+from .parallel_compositor import ParallelCompositor
 from .tile_cache import TileCache
 
 
 class RenderPipeline:
     """Full pipeline: layer compositing -> adjustment layers -> output."""
 
-    def __init__(self, cache_budget_mb: int = 512) -> None:
+    def __init__(self, cache_budget_mb: int = 512,
+                 max_workers: int | None = None) -> None:
         self._layer_cache = LayerRasterCache(budget_bytes=cache_budget_mb << 20)
-        self._compositor = PlanarCompositor(cache=self._layer_cache)
+        self._compositor = ParallelCompositor(
+            cache=self._layer_cache, max_workers=max_workers)
         self._tile_cache = TileCache(tile_size=256)
         self._last_width = 0
         self._last_height = 0
         # Cached outputs
         self._result_planar: np.ndarray | None = None
         self._planar_valid: bool = False
+        self._result_level: int = 0
         self._result_uint8: np.ndarray | None = None
         self._uint8_valid: bool = False
         self._uint8_buf: np.ndarray | None = None
 
     # ---- Composite ---------------------------------------------------------
 
-    def execute_planar(self, document: Document) -> np.ndarray:
-        """Composite to a planar (4, H, W) float32 buffer."""
+    def execute_planar(self, document: Document, level: int = 0) -> np.ndarray:
+        """Composite to a planar (4, H, W) float32 buffer at *level*.
+
+        Level L renders at 1/2**L scale. Level 0 is full resolution.
+        """
         w, h = document.width, document.height
         if w != self._last_width or h != self._last_height:
             self._tile_cache.initialize(w, h)
             self._last_width, self._last_height = w, h
-        if self._planar_valid and self._result_planar is not None:
+        if (self._planar_valid and self._result_planar is not None
+                and self._result_level == level):
             return self._result_planar
-        result = self._compositor.composite(document.layers, w, h)
+        ow, oh = level_size(w, h, level)
+        result = self._compositor.composite(
+            document.layers, ow, oh, level=level)
         self._result_planar = result
         self._planar_valid = True
+        self._result_level = level
         return result
+
+    def preview_level(self, document: Document, max_size: int) -> int:
+        """Mip level whose longest side fits within *max_size* pixels."""
+        return LayerRasterCache.choose_level(
+            document.width, document.height, max_size)
 
     def execute(self, document: Document) -> np.ndarray:
         """Composite to an interleaved (H, W, 4) float32 buffer.
@@ -63,11 +78,12 @@ class RenderPipeline:
         """
         return to_interleaved(self.execute_planar(document))
 
-    def execute_to_uint8(self, document: Document) -> np.ndarray:
+    def execute_to_uint8(self, document: Document, level: int = 0) -> np.ndarray:
         """Return the composite as uint8 RGBA, cached between invalidations."""
-        if self._uint8_valid and self._result_uint8 is not None:
+        if (self._uint8_valid and self._result_uint8 is not None
+                and self._result_level == level):
             return self._result_uint8
-        planar = self.execute_planar(document)
+        planar = self.execute_planar(document, level=level)
         h, w = planar.shape[1], planar.shape[2]
         shape = (h, w, 4)
         if self._uint8_buf is None or self._uint8_buf.shape != shape:
@@ -110,6 +126,19 @@ class RenderPipeline:
 
     def cache_stats(self) -> dict:
         return self._layer_cache.stats()
+
+    def shutdown(self) -> None:
+        """Release the compositor's worker threads."""
+        self._compositor.shutdown()
+
+
+def level_size(width: int, height: int, level: int) -> tuple[int, int]:
+    """Output size of a composite rendered at mip *level*."""
+    if level <= 0:
+        return width, height
+    scale = 1.0 / (1 << level)
+    return (max(1, int(round(width * scale))),
+            max(1, int(round(height * scale))))
 
 
 def _planar_to_uint8(planar: np.ndarray, out: np.ndarray) -> None:

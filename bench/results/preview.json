@@ -1,0 +1,130 @@
+{
+  "name": "preview",
+  "env": {
+    "python": "3.13.15",
+    "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+    "machine": "arm64",
+    "cpu_count": 14,
+    "numpy": "2.4.2",
+    "opencv": "4.13.0",
+    "cv2_threads": 14,
+    "pyside6": "6.10.2"
+  },
+  "results": [
+    {
+      "name": "preview_1L",
+      "iterations": 5,
+      "best_ms": 5.618,
+      "median_ms": 5.683,
+      "mean_ms": 5.841,
+      "fps": 175.97,
+      "layers": 1,
+      "mode": "preview",
+      "level": 1,
+      "cache_mb": 31.6,
+      "hit_rate": 1.0
+    },
+    {
+      "name": "full_1L",
+      "iterations": 5,
+      "best_ms": 22.272,
+      "median_ms": 22.687,
+      "mean_ms": 22.726,
+      "fps": 44.08,
+      "layers": 1,
+      "mode": "full"
+    },
+    {
+      "name": "preview_5L",
+      "iterations": 5,
+      "best_ms": 13.004,
+      "median_ms": 13.664,
+      "mean_ms": 14.002,
+      "fps": 73.19,
+      "layers": 5,
+      "mode": "preview",
+      "level": 1,
+      "cache_mb": 158.2,
+      "hit_rate": 1.0
+    },
+    {
+      "name": "full_5L",
+      "iterations": 5,
+      "best_ms": 46.412,
+      "median_ms": 47.903,
+      "mean_ms": 49.286,
+      "fps": 20.88,
+      "layers": 5,
+      "mode": "full"
+    },
+    {
+      "name": "preview_10L",
+      "iterations": 5,
+      "best_ms": 19.292,
+      "median_ms": 20.705,
+      "mean_ms": 20.316,
+      "fps": 48.3,
+      "layers": 10,
+      "mode": "preview",
+      "level": 1,
+      "cache_mb": 316.4,
+      "hit_rate": 1.0
+    },
+    {
+      "name": "full_10L",
+      "iterations": 5,
+      "best_ms": 304.28,
+      "median_ms": 314.058,
+      "mean_ms": 312.83,
+      "fps": 3.18,
+      "layers": 10,
+      "mode": "full"
+    },
+    {
+      "name": "preview_20L",
+      "iterations": 5,
+      "best_ms": 33.74,
+      "median_ms": 34.916,
+      "mean_ms": 42.366,
+      "fps": 28.64,
+      "layers": 20,
+      "mode": "preview",
+      "level": 1,
+      "cache_mb": 632.8,
+      "hit_rate": 1.0
+    },
+    {
+      "name": "full_20L",
+      "iterations": 5,
+      "best_ms": 591.721,
+      "median_ms": 603.033,
+      "mean_ms": 602.42,
+      "fps": 1.66,
+      "layers": 20,
+      "mode": "full"
+    },
+    {
+      "name": "preview_30L",
+      "iterations": 5,
+      "best_ms": 47.441,
+      "median_ms": 48.572,
+      "mean_ms": 48.905,
+      "fps": 20.59,
+      "layers": 30,
+      "mode": "preview",
+      "level": 1,
+      "cache_mb": 949.2,
+      "hit_rate": 1.0
+    },
+    {
+      "name": "full_30L",
+      "iterations": 5,
+      "best_ms": 873.833,
+      "median_ms": 876.508,
+      "mean_ms": 878.245,
+      "fps": 1.14,
+      "layers": 30,
+      "mode": "full"
+    }
+  ]
+}

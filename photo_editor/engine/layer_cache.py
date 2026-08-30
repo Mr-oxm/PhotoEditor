@@ -1,4 +1,4 @@
-"""Cache of per-layer prepared raster data.
+"""Cache of per-layer prepared raster data, at multiple resolutions.
 
 Preparing a layer for compositing means applying its styles, channel
 toggles and scoped adjustment/filter children, then converting the result
@@ -19,11 +19,20 @@ An entry is keyed by the layer id and validated against a *content key*:
   dragging an adjustment slider invalidates the layer it applies to.
 
 The cache is bounded by total bytes and evicts least-recently-used entries.
+
+Mip levels
+----------
+Entries are keyed by ``(layer id, level)`` where level *L* means a scale of
+``1 / 2**L``. Compositing a 4K document for a 1600x1000 viewport only needs
+level 1 (1920x1080), which is 31.6 MB per layer instead of 126.6 MB -- the
+difference between twenty layers fitting in a 1 GB cache and thrashing it
+five times over. Level 0 is the full-resolution path used for export.
 """
 
 from __future__ import annotations
 
 from collections import OrderedDict
+from threading import Lock
 
 import numpy as np
 
@@ -78,8 +87,31 @@ class LayerRasterCache:
         self._bytes = 0
         self._hits = 0
         self._misses = 0
+        # Band-parallel rendering reads this cache from several worker
+        # threads at once, and LRU bookkeeping mutates the ordering.
+        self._lock = Lock()
 
     # ---- Keying ------------------------------------------------------------
+
+    @staticmethod
+    def level_scale(level: int) -> float:
+        return 1.0 / (1 << level)
+
+    @staticmethod
+    def choose_level(width: int, height: int, max_size: int,
+                     max_level: int = 5) -> int:
+        """Smallest mip level whose longest side fits within *max_size*.
+
+        Returns 0 (full resolution) when *max_size* is 0 or already large
+        enough, so the export path is unaffected.
+        """
+        if max_size <= 0:
+            return 0
+        longest = max(width, height)
+        level = 0
+        while level < max_level and (longest >> level) > max_size:
+            level += 1
+        return level
 
     @staticmethod
     def _content_key(layer, adj_layers):
@@ -104,20 +136,22 @@ class LayerRasterCache:
 
     # ---- Access ------------------------------------------------------------
 
-    def get_prepared(self, layer, adj_layers):
-        """Return the cached (planar, blend_pos) for *layer*, or None."""
+    def get_prepared(self, layer, adj_layers, level: int = 0):
+        """Return the cached (planar, blend_pos) at *level*, or None."""
         key = self._content_key(layer, adj_layers)
         if key is None:
             return None
-        entry = self._entries.get(layer.id)
-        if entry is None or entry[0] != key:
-            self._misses += 1
-            return None
-        self._entries.move_to_end(layer.id)
-        self._hits += 1
-        return entry[1]
+        slot = (layer.id, level)
+        with self._lock:
+            entry = self._entries.get(slot)
+            if entry is None or entry[0] != key:
+                self._misses += 1
+                return None
+            self._entries.move_to_end(slot)
+            self._hits += 1
+            return entry[1]
 
-    def put_prepared(self, layer, adj_layers, value) -> None:
+    def put_prepared(self, layer, adj_layers, value, level: int = 0) -> None:
         key = self._content_key(layer, adj_layers)
         if key is None:
             return
@@ -125,12 +159,14 @@ class LayerRasterCache:
         size = planar.nbytes
         if size > self._budget:
             return  # A single layer larger than the whole budget: don't cache.
-        old = self._entries.pop(layer.id, None)
-        if old is not None:
-            self._bytes -= old[1][0].nbytes
-        self._entries[layer.id] = (key, value)
-        self._bytes += size
-        self._evict()
+        slot = (layer.id, level)
+        with self._lock:
+            old = self._entries.pop(slot, None)
+            if old is not None:
+                self._bytes -= old[1][0].nbytes
+            self._entries[slot] = (key, value)
+            self._bytes += size
+            self._evict()
 
     def _evict(self) -> None:
         while self._bytes > self._budget and self._entries:
@@ -140,13 +176,16 @@ class LayerRasterCache:
     # ---- Invalidation ------------------------------------------------------
 
     def invalidate(self, layer_id: str) -> None:
-        entry = self._entries.pop(layer_id, None)
-        if entry is not None:
-            self._bytes -= entry[1][0].nbytes
+        """Drop every mip level cached for *layer_id*."""
+        with self._lock:
+            for slot in [k for k in self._entries if k[0] == layer_id]:
+                entry = self._entries.pop(slot)
+                self._bytes -= entry[1][0].nbytes
 
     def clear(self) -> None:
-        self._entries.clear()
-        self._bytes = 0
+        with self._lock:
+            self._entries.clear()
+            self._bytes = 0
 
     # ---- Introspection -----------------------------------------------------
 
