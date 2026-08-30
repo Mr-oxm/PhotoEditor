@@ -1,6 +1,6 @@
 # Basera — Performance Overhaul & Evolution Plan
 
-**Status:** Phase 0 complete (baseline measured, architecture spiked and validated)
+**Status:** Phases 1-4 landed (engine). Phase 5 (UI/IO) and 6 (product) in progress.
 **Owner:** performance/graphics workstream
 **Last updated:** 2026-08-30
 
@@ -34,6 +34,24 @@ design (`bench/spike_architecture.py`, `bench/spike_parallel.py`) measured:
 | Resolution retained | full | full | no loss |
 
 The targets below are therefore grounded in measurement, not aspiration.
+
+### Results actually achieved (measured in the running application)
+
+20 layers at 3840×2160, moving one layer, measured through `MainWindow`:
+
+| Zoom | Baseline | Now | Change |
+|---|---:|---:|---:|
+| Fit | 3,981 ms | **30 ms** (33 fps) | **133×** |
+| 50% | 3,981 ms | **29 ms** (34 fps) | **137×** |
+| 100% | 3,981 ms | **28 ms** (35 fps) | **142×** |
+
+| Metric | Baseline | Now | Change |
+|---|---:|---:|---:|
+| Undo snapshot | 667 ms | **2.9 ms** | **230×** |
+| Undo memory, 20×4K | 2,531 MB/state (124 GB projected) | **1,139 MB total, bounded** | independent of layer count |
+| Single 4K NORMAL blend | 233 ms | **17 ms** | **13.3×** |
+| Full-resolution export composite | 3,981 ms | 603 ms | 6.6× |
+| Test suite | 550 pass | **841 pass** | +291 tests |
 
 ---
 
@@ -347,6 +365,28 @@ guessed at here. Recorded in §8 as the review proceeds.
 | 2026-08-30 | 0 | Primitive decomposition | strided RGB slice = 8.7× penalty |
 | 2026-08-30 | 0 | Architecture spike | 12.2 ms drag frame (376×), 843 MB |
 | 2026-08-30 | 0 | Parallelism spike | 6.4× @ 8 threads / 64-row bands |
+| 2026-08-30 | 1 | Fidelity gate: 42 golden scenes @ 1/255 | gate green, caught non-deterministic Dissolve |
+| 2026-08-30 | 1 | Planar blend core | 4K NORMAL 233 → 17 ms (13.3×) |
+| 2026-08-30 | 1 | Planar compositor + layer cache | 20×4K 3,981 → 588 ms (6.8×) |
+| 2026-08-30 | 1 | Copy-on-write history + byte budget | 667 → 2.9 ms; memory now layer-count independent |
+| 2026-08-30 | 2 | Mip-level preview rendering | 20×4K preview 2,194 → 34.9 ms (17×) |
+| 2026-08-30 | 4 | Band-parallel compositing | 6.4× where the working set fits cache |
+| 2026-08-30 | 2 | Viewport ROI + ROI-cropped preparation | 100% zoom 948 → 28 ms (33×) |
+
+### Bugs found and fixed along the way
+
+The performance work surfaced several genuine correctness bugs. Each has a
+regression test.
+
+| Bug | Symptom | Fix |
+|---|---|---|
+| Dissolve used unseeded `np.random` | Dissolve layers flickered every frame; output uncacheable and untestable | Stable per-size dither field |
+| Invalidating during an in-flight render | Render finishing after an edit published stale output as *valid*; canvas kept showing the pre-edit picture | Epoch-versioned cache publication |
+| Band-parallel compositors indexed by band | With more bands than workers, concurrent bands shared a compositor and raced on its state, dropping layers | Thread-local compositors |
+| `int(round())` placement | Banker's rounding is not translation-invariant, so layers at odd positions jittered by a pixel while panning | Round half-up |
+| float→uint8 truncation | Every displayed and exported channel biased down by up to one level (0.25 → 63) | Round instead of truncate |
+| Root adjustment layers rebind the canvas | Band writes into the caller's buffer were discarded | Copy back on rebind |
+| Preview buffer size leaked into document coords | Latent: overlays, guides and hit-testing would rescale when the preview level changed | Document size tracked separately from buffer size |
 
 ---
 
