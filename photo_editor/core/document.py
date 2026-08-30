@@ -65,6 +65,10 @@ class Document:
         self.layers.add(layer)
         self._snapshot(f"Add {name}")
         self._dirty = True
+        # The snapshot freezes every layer for copy-on-write. A layer we are
+        # handing straight back to the caller is almost always about to be
+        # filled, so un-share it now rather than making every caller do it.
+        layer.begin_write()
         return layer
 
     def add_group(self, name: str = "Group") -> Layer:
@@ -73,6 +77,7 @@ class Document:
         self.layers.update_group_bbox(group)  # Empty group: position (0,0), minimal size
         self._snapshot(f"Add Group {name}")
         self._dirty = True
+        group.begin_write()
         return group
 
     def group_selected_layers(self, layer_ids: list[str], name: str = "Group") -> Layer | None:
@@ -91,6 +96,7 @@ class Document:
         self.layers.add(layer)
         self._snapshot(f"Place {name}")
         self._dirty = True
+        layer.begin_write()
         return layer
 
     def add_vector_layer(self, name: str = "Vector Layer") -> Layer:
@@ -108,6 +114,7 @@ class Document:
         self.layers.add(layer)
         self._snapshot(f"Add {name}")
         self._dirty = True
+        layer.begin_write()
         return layer
 
     def remove_layer(self, layer_id: str) -> None:
@@ -415,8 +422,8 @@ class Document:
             return
         # Combine this mask layer's grayscale into the parent's alpha
         grayscale = mask_layer.get_mask_grayscale()
+        parent.begin_write()
         parent.pixels[..., 3] *= grayscale
-        parent.touch()
         self.layers.remove_mask_layer(mask_layer_id)
         self._snapshot("Apply Mask Layer")
         self._dirty = True
@@ -467,15 +474,38 @@ class Document:
     def _build_history_state(self, action: str) -> HistoryState:
         """Create a serializable snapshot of the current document state."""
         state = HistoryState(name=action)
-        # Save pixel data and mask data for every layer
+        # Save pixel and mask data for every layer, sharing buffers with the
+        # previous snapshot for layers that have not changed. An edit usually
+        # touches one layer, so this turns an O(all layers) deep copy into an
+        # O(changed layers) one -- 2,531 MB -> ~127 MB for a 20-layer 4K doc.
+        prev = self.history.latest()
+
+        def _capture(key: str, arr, version: int) -> None:
+            """Store *arr* under *key* without copying.
+
+            History takes a *reference*; the layer is then frozen, so the
+            next in-place edit copy-on-writes and leaves this snapshot
+            holding the old content. Unchanged layers additionally reuse
+            the previous state's entry, so a static layer costs nothing at
+            all no matter how many snapshots are taken.
+            """
+            if arr is None:
+                return
+            if (prev is not None
+                    and prev.layer_versions.get(key) == version
+                    and key in prev.layer_data):
+                state.layer_data[key] = prev.layer_data[key]
+            else:
+                state.layer_data[key] = arr
+            state.layer_versions[key] = version
+
         for layer in self.layers:
-            state.layer_data[layer.id] = layer.pixels.copy()
-            if layer._source_pixels is not None:
-                state.layer_data[f"_src_{layer.id}"] = layer._source_pixels.copy()
-            if layer._source_mask is not None:
-                state.layer_data[f"_srcmask_{layer.id}"] = layer._source_mask.copy()
-            if layer._mask is not None:
-                state.layer_data[f"_mask_{layer.id}"] = layer._mask.copy()
+            version = layer.content_version
+            _capture(layer.id, layer.pixels, version)
+            _capture(f"_src_{layer.id}", layer._source_pixels, version)
+            _capture(f"_srcmask_{layer.id}", layer._source_mask, version)
+            _capture(f"_mask_{layer.id}", layer._mask, version)
+            layer.freeze()
         # Save the full layer structure so add/remove can be undone
         layer_metas = []
         for layer in self.layers:
@@ -520,14 +550,38 @@ class Document:
         state.metadata["_active_index"] = self.layers.active_index
         state.metadata["_doc_width"] = self.width
         state.metadata["_doc_height"] = self.height
-        # Save selection mask
-        if self.selection._mask is not None:
-            state.layer_data["__selection_mask__"] = self.selection._mask.copy()
+        # Save selection mask, sharing when the mask object is unchanged.
+        sel_mask = self.selection._mask
+        if sel_mask is not None:
+            # Selection has no copy-on-write hook and mutates in place, so
+            # this one is still copied -- it is a single-channel mask, ~1/16
+            # the cost of a layer.
+            prev_sel = prev.layer_data.get("__selection_mask__") if prev else None
+            prev_ver = prev.layer_versions.get("__selection_mask__") if prev else None
+            if prev_sel is not None and prev_ver == id(sel_mask):
+                state.layer_data["__selection_mask__"] = prev_sel
+            else:
+                state.layer_data["__selection_mask__"] = sel_mask.copy()
+            state.layer_versions["__selection_mask__"] = id(sel_mask)
         return state
+
+    def live_buffer_ids(self) -> set[int]:
+        """Identities of every array the live layer stack currently holds.
+
+        History shares buffers with the document until a layer
+        copy-on-writes, so its memory budget must discount these.
+        """
+        ids: set[int] = set()
+        for layer in self.layers:
+            for arr in (layer._pixels, layer._mask,
+                        layer._source_pixels, layer._source_mask):
+                if arr is not None:
+                    ids.add(id(arr))
+        return ids
 
     def _snapshot(self, action: str) -> None:
         state = self._build_history_state(action)
-        self.history.push(state)
+        self.history.push(state, live_ids=self.live_buffer_ids())
         # Every snapshot represents an edit — mark document dirty so the
         # unsaved-changes guard in closeEvent / tab-close picks it up.
         # (Structural ops like add_layer set _dirty explicitly too, but tool
@@ -570,19 +624,22 @@ class Document:
                 layer.children = list(meta.get("children", []))
                 layer.mask_layers = list(meta.get("mask_layers", []))
                 layer.ex_parent_id = meta.get("ex_parent_id")
-                # Restore pixel data
+                # Restore pixel data by reference and re-freeze: the layer
+                # copy-on-writes on its next edit, so undo itself is O(1) in
+                # pixel bytes instead of copying the whole stack.
                 if lid in state.layer_data:
-                    layer.pixels = state.layer_data[lid].copy()
+                    layer._adopt(state.layer_data[lid], frozen=True)
                 src_key = f"_src_{lid}"
                 if src_key in state.layer_data:
-                    layer._source_pixels = state.layer_data[src_key].copy()
+                    layer._source_pixels = state.layer_data[src_key]
                 srcmask_key = f"_srcmask_{lid}"
                 if srcmask_key in state.layer_data:
-                    layer._source_mask = state.layer_data[srcmask_key].copy()
+                    layer._source_mask = state.layer_data[srcmask_key]
                 # Restore mask data
                 mask_key = f"_mask_{lid}"
                 if mask_key in state.layer_data:
-                    layer._mask = state.layer_data[mask_key].copy()
+                    layer._mask = state.layer_data[mask_key]
+                layer.freeze()
                 # Restore text layer data
                 td_dict = meta.get("_text_data")
                 if td_dict is not None:

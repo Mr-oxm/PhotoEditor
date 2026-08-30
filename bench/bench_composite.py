@@ -100,29 +100,47 @@ def bench_blend_modes(report: Report, iterations: int) -> None:
 
 
 def bench_history(report: Report) -> None:
-    """Undo snapshot cost and memory — the classic multi-layer memory bomb."""
-    print("\n=== History snapshot (undo memory) ===")
+    """Undo cost under a realistic editing session.
+
+    The interesting number is not one snapshot of a static document -- it is
+    what a sequence of single-layer edits costs, because that is what
+    painting actually does. Structural sharing should make the cost scale
+    with the *changed* layer, not the whole stack.
+    """
+    print("\n=== History: 30 single-layer edits (realistic session) ===")
     for n in (1, 5, 20):
         doc = make_document(n, 3840, 2160)
         gc.collect()
         rss_before = live_rss_mb()
 
-        t = timeit(f"history_snapshot_{n}L_4K",
-                   lambda: doc.save_snapshot("bench"), iterations=3, warmup=0)
-        hist_mb = history_bytes(doc) / MB
+        target = doc.layers.layers[n // 2]
+        counter = {"i": 0}
+
+        def one_edit():
+            # Snapshot pre-edit (as tools do), then modify one layer.
+            doc.save_snapshot(f"edit{counter['i']}")
+            counter["i"] += 1
+            target.begin_write()
+            target.pixels[100:200, 100:200] = 0.5
+
+        t = timeit(f"history_edit_{n}L_4K", one_edit, iterations=30, warmup=0)
+        stats = doc.history.stats(doc.live_buffer_ids())
+        retained = stats["owned_mb"]
         rss_after = live_rss_mb()
-        per_state_mb = hist_mb / max(1, len(doc.history.states))
-        projected_mb = per_state_mb * doc.history._max
+        one_layer_mb = target.pixels.nbytes / MB
         report.add(
             t, layers=n,
-            history_mb=round(hist_mb, 1),
-            per_state_mb=round(per_state_mb, 1),
-            projected_full_history_mb=round(projected_mb, 1),
+            history_owned_mb=round(retained, 1),
+            history_referenced_mb=stats["mb"],
+            states=len(doc.history.states),
+            one_layer_mb=round(one_layer_mb, 1),
+            budget_mb=round(doc.history._budget / MB, 1),
             rss_delta_mb=round(rss_after - rss_before, 1),
         )
-        print(f"  {n:>3} layers: {t.median_ms:8.1f} ms/snapshot  "
-              f"{per_state_mb:7.1f} MB/state  "
-              f"projected @{doc.history._max} states: {projected_mb / 1024:.1f} GB")
+        print(f"  {n:>3} layers: {t.median_ms:7.1f} ms/snapshot  "
+              f"{len(doc.history.states):>3} states  "
+              f"{retained:7.1f} MB owned by history "
+              f"({retained / one_layer_mb:.1f} layers' worth)")
         del doc
         gc.collect()
 

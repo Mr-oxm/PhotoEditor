@@ -131,6 +131,7 @@ class BrushTool(Tool):
         layer = doc.layers.active_layer
         if layer is None or layer.locked:
             return
+        layer.begin_write()
         lx, ly = layer.position
         radius = self._effective_radius(pressure)
         eff_opacity = self._effective_opacity(pressure)
@@ -159,7 +160,6 @@ class BrushTool(Tool):
     # ------------------------------------------------------------------
     # Tool interface
     # ------------------------------------------------------------------
-        layer.touch()
 
 
     def on_press(self, doc: Document, x: int, y: int, pressure: float = 1.0) -> None:

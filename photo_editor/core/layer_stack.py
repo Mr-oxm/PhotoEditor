@@ -406,10 +406,10 @@ class LayerStack:
         )
         # Fill with white (fully visible) or black (fully hidden)
         fill_val = 1.0 if fill_white else 0.0
+        mask_layer.begin_write()
         mask_layer._pixels[:] = np.array(
             [fill_val, fill_val, fill_val, 1.0], dtype=np.float32
         )
-        mask_layer.touch()
 
         if target:
             mask_layer.parent_id = target_id
@@ -510,9 +510,9 @@ class LayerStack:
         if mask_layer is None:
             return None
         # Broadcast the grayscale selection into RGB channels, keep alpha=1
+        mask_layer.begin_write()
         mask_layer._pixels[..., 0] = selection_mask
         mask_layer._pixels[..., 1] = selection_mask
         mask_layer._pixels[..., 2] = selection_mask
         mask_layer._pixels[..., 3] = 1.0
-        mask_layer.touch()
         return mask_layer

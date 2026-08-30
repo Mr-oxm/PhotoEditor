@@ -134,6 +134,7 @@ class EraserTool(Tool):
         layer = doc.layers.active_layer
         if layer is None or layer.locked:
             return
+        layer.begin_write()
         lx, ly = layer.position
         radius = self._effective_radius(pressure)
         eff_opacity = self.opacity * pressure
@@ -169,7 +170,6 @@ class EraserTool(Tool):
                 for px, py in self._stroke_points(x0, y0, x1, y1, step):
                     self._erase_circle(layer.pixels, px - lx, py - ly, radius,
                                        self.hardness, eff_opacity, sel_mask=sel_mask)
-        layer.touch()
 
     # ------------------------------------------------------------------
     # Tool interface

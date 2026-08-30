@@ -303,8 +303,8 @@ class MoveTool(FloatSelectionMixin, ResizeMixin, RotateMixin, VectorCommitMixin,
                 mask4 = sel_mask[..., np.newaxis]
                 self._float_orig = layer.pixels.copy()
                 self._float_pixels = layer.pixels * mask4
+                layer.begin_write()
                 layer.pixels[:] = layer.pixels * (1.0 - mask4)
-                layer.touch()
                 np.clip(layer.pixels, 0, 1, out=layer.pixels)
                 self._float_base = layer.pixels.copy()
                 self._floating = True
@@ -560,8 +560,8 @@ class MoveTool(FloatSelectionMixin, ResizeMixin, RotateMixin, VectorCommitMixin,
         if self._floating and self._float_pixels is not None and self._float_base is not None:
             self._float_dx = self._float_committed_dx + dx
             self._float_dy = self._float_committed_dy + dy
+            layer.begin_write()
             layer.pixels[:] = self._float_base
-            layer.touch()
             self._composite_float(layer.pixels, self._float_dx, self._float_dy)
             return
 

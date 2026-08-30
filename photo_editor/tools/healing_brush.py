@@ -155,7 +155,6 @@ class HealingBrushTool(Tool):
         for px, py in self._stroke_points(x0, y0, x1, y1, step):
             self._heal_patch(layer.pixels, px - lx, py - ly, radius,
                              sel_mask=sel_mask)
-        layer.touch()
 
     # ------------------------------------------------------------------
     # Tool interface

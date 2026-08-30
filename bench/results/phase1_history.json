@@ -1,0 +1,60 @@
+{
+  "name": "baseline-composite",
+  "env": {
+    "python": "3.13.15",
+    "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+    "machine": "arm64",
+    "cpu_count": 14,
+    "numpy": "2.4.2",
+    "opencv": "4.13.0",
+    "cv2_threads": 14,
+    "pyside6": "6.10.2"
+  },
+  "results": [
+    {
+      "name": "history_edit_1L_4K",
+      "iterations": 30,
+      "best_ms": 2.201,
+      "median_ms": 2.822,
+      "mean_ms": 4.706,
+      "fps": 354.41,
+      "layers": 1,
+      "history_owned_mb": 1139.1,
+      "history_referenced_mb": 1139.1,
+      "states": 9,
+      "one_layer_mb": 126.6,
+      "budget_mb": 1024.0,
+      "rss_delta_mb": 1012.7
+    },
+    {
+      "name": "history_edit_5L_4K",
+      "iterations": 30,
+      "best_ms": 2.201,
+      "median_ms": 2.786,
+      "mean_ms": 3.869,
+      "fps": 358.99,
+      "layers": 5,
+      "history_owned_mb": 1139.1,
+      "history_referenced_mb": 1645.3,
+      "states": 9,
+      "one_layer_mb": 126.6,
+      "budget_mb": 1024.0,
+      "rss_delta_mb": 506.3
+    },
+    {
+      "name": "history_edit_20L_4K",
+      "iterations": 30,
+      "best_ms": 2.173,
+      "median_ms": 2.889,
+      "mean_ms": 6.225,
+      "fps": 346.11,
+      "layers": 20,
+      "history_owned_mb": 1139.1,
+      "history_referenced_mb": 3543.8,
+      "states": 9,
+      "one_layer_mb": 126.6,
+      "budget_mb": 1024.0,
+      "rss_delta_mb": 886.1
+    }
+  ]
+}

@@ -65,6 +65,11 @@ class Layer:
         # The render pipeline's layer cache keys off this, so any code path
         # that mutates pixels in place must call touch().
         self._content_version: int = 0
+        # Copy-on-write: set when the undo history holds a reference to this
+        # layer's buffers. While frozen the arrays are marked non-writeable,
+        # so an in-place edit that forgot begin_write() raises immediately
+        # instead of silently corrupting a stored history state.
+        self._frozen: bool = False
         self._pixels = np.zeros((self.height, self.width, 4), dtype=np.float32)
         self._mask: np.ndarray | None = None
         self._styles: list = []
@@ -99,6 +104,7 @@ class Layer:
     def pixels(self, value: np.ndarray) -> None:
         self._pixels = value.astype(np.float32) if value.dtype != np.float32 else value
         self.height, self.width = value.shape[:2]
+        self._frozen = False
         self._content_version += 1
 
     # ---- Content versioning -------------------------------------------------
@@ -115,6 +121,48 @@ class Layer:
         which the property setter never sees. They must call this so cached
         renders of the layer are dropped.
         """
+        self._content_version += 1
+
+    def begin_write(self) -> None:
+        """Take private ownership of the pixel buffers before editing.
+
+        Undo snapshots reference a layer's arrays rather than copying them,
+        which is what makes multi-layer undo affordable. This un-shares them
+        again on the first write after a snapshot, so history keeps the old
+        content and the layer gets a buffer it may mutate.
+
+        Every in-place edit must call this *before* writing. Frozen buffers
+        are non-writeable, so a missed call fails loudly and immediately.
+        """
+        if self._frozen:
+            self._pixels = self._pixels.copy()
+            if self._mask is not None and not self._mask.flags.writeable:
+                self._mask = self._mask.copy()
+            if self._source_pixels is not None and not self._source_pixels.flags.writeable:
+                self._source_pixels = self._source_pixels.copy()
+            if self._source_mask is not None and not self._source_mask.flags.writeable:
+                self._source_mask = self._source_mask.copy()
+            self._frozen = False
+        self._content_version += 1
+
+    def freeze(self) -> None:
+        """Mark the buffers as shared with history and make them read-only."""
+        self._frozen = True
+        for arr in (self._pixels, self._mask,
+                    self._source_pixels, self._source_mask):
+            if arr is not None:
+                try:
+                    arr.flags.writeable = False
+                except ValueError:
+                    # A view whose base is already read-only, or an array
+                    # that does not own its data -- already effectively frozen.
+                    pass
+
+    def _adopt(self, pixels: np.ndarray, frozen: bool) -> None:
+        """Install *pixels* directly, optionally as a frozen shared buffer."""
+        self._pixels = pixels
+        self.height, self.width = pixels.shape[:2]
+        self._frozen = frozen
         self._content_version += 1
 
     # ---- Non-destructive transform API --------------------------------------
@@ -159,6 +207,7 @@ class Layer:
             self._source_pixels = self._pixels.copy()
             if self._mask is not None:
                 self._source_mask = self._mask.copy()
+            self._content_version += 1
             # Ensure base dimensions are initialised
             if self.transform_base_w == 0:
                 self.transform_base_w = self.width
