@@ -22,7 +22,7 @@ from __future__ import annotations
 import numpy as np
 
 from ..core.enums import BlendMode
-from .planar_modes import get_planar_blend_func
+from .planar_modes import POSITION_DEPENDENT, get_planar_blend_func
 
 _EPS = 1e-10
 
@@ -76,6 +76,7 @@ def blend_planar_region(
     opacity: float = 1.0,
     mask: np.ndarray | None = None,
     scratch: "PlanarScratch | None" = None,
+    abs_origin: tuple[int, int] = (0, 0),
 ) -> None:
     """Blend planar *over* into planar *canvas* at *position*, in place.
 
@@ -87,6 +88,10 @@ def blend_planar_region(
     mode, opacity : blend mode and layer opacity.
     mask : optional (h, w) float32 mask in the *source's* coordinate space.
     scratch : optional reusable buffers, to avoid per-call allocation.
+    abs_origin : absolute document position of *canvas*'s top-left. Only
+        position-dependent modes (Dissolve) use it, but they need it: a
+        pattern derived from the block's own size differs between a
+        band-parallel render and a whole-canvas one.
     """
     ch, cw = canvas.shape[1], canvas.shape[2]
     lh, lw = over.shape[1], over.shape[2]
@@ -129,7 +134,12 @@ def blend_planar_region(
     if mode == BlendMode.NORMAL:
         contrib = src[:3] * over_a
     else:
-        blended = get_planar_blend_func(mode)(base[:3], src[:3])
+        fn = get_planar_blend_func(mode)
+        if mode in POSITION_DEPENDENT:
+            blended = fn(base[:3], src[:3],
+                         (abs_origin[1] + dy, abs_origin[0] + dx))
+        else:
+            blended = fn(base[:3], src[:3])
         blended = np.clip(blended, 0.0, 1.0)
         contrib = blended * over_a
 

@@ -148,6 +148,9 @@ class HealingBrushTool(Tool):
         layer = doc.layers.active_layer
         if layer is None or layer.locked:
             return
+        # Undo snapshots share this layer's buffer and mark it read-only, so
+        # take private ownership before healing into it in place.
+        layer.begin_write()
         lx, ly = layer.position
         radius = max(1, self.size // 2)
         step = max(1.0, radius * 0.5)

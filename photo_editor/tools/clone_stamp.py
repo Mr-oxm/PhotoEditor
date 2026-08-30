@@ -130,6 +130,9 @@ class CloneStampTool(Tool):
         layer = doc.layers.active_layer
         if layer is None or layer.locked:
             return
+        # Undo snapshots share this layer's buffer and mark it read-only, so
+        # take private ownership before stamping into it in place.
+        layer.begin_write()
         lx, ly = layer.position
         radius = self._effective_radius(pressure)
         step = max(1.0, radius * 2 * self.spacing)

@@ -440,12 +440,19 @@ class PlanarCompositor:
             over_key = None
 
         prev_img: np.ndarray | None = None
-        borrowed: list[np.ndarray] = []
+        # Keyed by id(): `buf in borrowed` on a list of ndarrays compares
+        # elementwise and raises "truth value of an array is ambiguous",
+        # which aborted every render of a document with a group followed by
+        # a clipping layer. Identity is what was meant anyway -- these are
+        # scratch buffers being tracked for release, not values.
+        borrowed: dict[int, np.ndarray] = {}
 
         def release_prev(buf: np.ndarray | None) -> None:
-            if buf is not None and buf in borrowed:
-                borrowed.remove(buf)
-                self._scratch.release(buf)
+            if buf is None:
+                return
+            taken = borrowed.pop(id(buf), None)
+            if taken is not None:
+                self._scratch.release(taken)
 
         for layer in visible:
             # --- Root-level adjustment/filter: applies to the canvas ----
@@ -497,7 +504,8 @@ class PlanarCompositor:
                         group_mask, self._pos(layer.position), width, height)
                     group_img[3] *= placed_mask
                 blend_planar_region(canvas, group_img, (0, 0),
-                                    layer.blend_mode, layer.opacity)
+                                    layer.blend_mode, layer.opacity,
+                                    abs_origin=(self._ox, self._oy))
                 release_prev(prev_img)
                 prev_img = group_img
                 continue
@@ -517,21 +525,22 @@ class PlanarCompositor:
             if layer.clipping_mask and prev_img is not None:
                 placed = self._place_planar(
                     pixels, self._pos(blend_pos), width, height)
-                borrowed.append(placed)
+                borrowed[id(placed)] = placed
                 placed[3] *= prev_img[3]
                 placed_mask = (
                     self._place_mask_combined(layer, stack, width, height, crop)
                     if mask is not None else None
                 )
                 blend_planar_region(canvas, placed, (0, 0),
-                                    layer.blend_mode, layer.opacity, placed_mask)
+                                    layer.blend_mode, layer.opacity, placed_mask,
+                                    abs_origin=(self._ox, self._oy))
                 release_prev(prev_img)
                 prev_img = placed
 
             elif _has_clip_child:
                 parent_placed = self._place_planar(
                     pixels, self._pos(blend_pos), width, height)
-                borrowed.append(parent_placed)
+                borrowed[id(parent_placed)] = parent_placed
                 for child in regular_children[layer.id]:
                     if not child.clips_parent:
                         continue
@@ -548,7 +557,8 @@ class PlanarCompositor:
                     if mask is not None else None
                 )
                 blend_planar_region(canvas, parent_placed, (0, 0),
-                                    layer.blend_mode, layer.opacity, placed_mask)
+                                    layer.blend_mode, layer.opacity, placed_mask,
+                                    abs_origin=(self._ox, self._oy))
                 for child in regular_children[layer.id]:
                     if child.clips_parent:
                         continue
@@ -560,12 +570,13 @@ class PlanarCompositor:
 
             else:
                 blend_planar_region(canvas, pixels, self._pos(blend_pos),
-                                    layer.blend_mode, layer.opacity, mask)
+                                    layer.blend_mode, layer.opacity, mask,
+                                    abs_origin=(self._ox, self._oy))
                 release_prev(prev_img)
                 if layer.id in needs_placed or layer.id in regular_children:
                     prev_img = self._place_planar(
                         pixels, self._pos(blend_pos), width, height)
-                    borrowed.append(prev_img)
+                    borrowed[id(prev_img)] = prev_img
                 else:
                     prev_img = None
 
@@ -581,7 +592,7 @@ class PlanarCompositor:
                     prev_img = None
 
         release_prev(prev_img)
-        for buf in borrowed:
+        for buf in borrowed.values():
             self._scratch.release(buf)
         if out_buf is not None and canvas is not out_buf:
             np.copyto(out_buf, canvas)
@@ -730,7 +741,8 @@ class PlanarCompositor:
             if c_mask is not None else None
         )
         blend_planar_region(canvas, c_placed, (0, 0),
-                            child.blend_mode, child.opacity, c_placed_mask)
+                            child.blend_mode, child.opacity, c_placed_mask,
+                            abs_origin=(self._ox, self._oy))
         self._scratch.release(c_placed)
 
     # ------------------------------------------------------------------
@@ -810,7 +822,8 @@ class PlanarCompositor:
                     if mask is not None else None
                 )
                 blend_planar_region(canvas, parent_placed, (0, 0),
-                                    layer.blend_mode, layer.opacity, placed_mask)
+                                    layer.blend_mode, layer.opacity, placed_mask,
+                                    abs_origin=(self._ox, self._oy))
                 for child in regular_children[layer.id]:
                     if child.clips_parent:
                         continue
@@ -820,7 +833,8 @@ class PlanarCompositor:
                 self._scratch.release(parent_placed)
             else:
                 blend_planar_region(canvas, pixels, self._pos(blend_pos),
-                                    layer.blend_mode, layer.opacity, mask)
+                                    layer.blend_mode, layer.opacity, mask,
+                                    abs_origin=(self._ox, self._oy))
                 if layer.id in regular_children:
                     parent_placed = self._place_planar(
                         pixels, self._pos(blend_pos), w, h)

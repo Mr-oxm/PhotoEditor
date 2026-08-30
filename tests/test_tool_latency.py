@@ -136,3 +136,69 @@ def test_transform_release_leaves_a_full_quality_layer():
     tool.on_release(doc, 80, 70)
     assert layer.pixels.dtype == np.float32
     assert layer.pixels.size > 0
+
+
+# ---------------------------------------------------------------------------
+# Copy-on-write regressions
+# ---------------------------------------------------------------------------
+# Clone Stamp and Healing Brush both raised
+#   ValueError: assignment destination is read-only
+# on their very first dab: on_press takes an undo snapshot, which freezes the
+# layer's buffer, and neither tool called begin_write() before stamping into
+# it. The brush and eraser were converted when the copy-on-write contract was
+# introduced; these two were missed, and nothing exercised them.
+
+@pytest.mark.parametrize("tool_path,needs_source", [
+    ("photo_editor.tools.clone_stamp:CloneStampTool", True),
+    ("photo_editor.tools.healing_brush:HealingBrushTool", True),
+    ("photo_editor.tools.brush:BrushTool", False),
+    ("photo_editor.tools.eraser:EraserTool", False),
+    ("photo_editor.tools.paint_bucket:PaintBucketTool", False),
+])
+def test_tool_can_paint_onto_a_frozen_layer(tool_path, needs_source):
+    """Every painting tool must survive a stroke after an undo snapshot."""
+    import importlib
+
+    module, cls_name = tool_path.split(":")
+    tool = getattr(importlib.import_module(module), cls_name)()
+    doc = _doc()
+    if needs_source:
+        tool.set_source(10, 10)
+
+    doc.save_snapshot("freeze")          # freezes every layer's buffer
+    assert not doc.layers.active_layer.pixels.flags.writeable
+
+    tool.on_press(doc, 40, 40, 1.0)
+    tool.on_move(doc, 55, 52, 1.0)
+    tool.on_release(doc, 55, 52)
+
+
+@pytest.mark.parametrize("tool_path", [
+    "photo_editor.tools.clone_stamp:CloneStampTool",
+    "photo_editor.tools.healing_brush:HealingBrushTool",
+])
+def test_stroke_does_not_corrupt_the_snapshot_it_was_frozen_from(tool_path):
+    """Copy-on-write must actually copy: the stored history state has to keep
+    its old pixels after the stroke writes."""
+    import importlib
+
+    import numpy as np
+
+    module, cls_name = tool_path.split(":")
+    tool = getattr(importlib.import_module(module), cls_name)()
+    doc = _doc()
+    tool.set_source(10, 10)
+    layer = doc.layers.active_layer
+    layer.begin_write()
+    layer.pixels[:] = 0.25
+
+    doc.save_snapshot("before stroke")
+    stored = doc.history.states[-1].layer_data[layer.id]
+    before = stored.copy()
+
+    tool.on_press(doc, 40, 40, 1.0)
+    tool.on_move(doc, 60, 55, 1.0)
+    tool.on_release(doc, 60, 55)
+
+    np.testing.assert_array_equal(
+        stored, before, "the stroke wrote into the stored history state")

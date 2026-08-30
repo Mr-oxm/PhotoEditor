@@ -716,16 +716,6 @@ class MainWindow(QMainWindow):
     def _do_deferred_panel_refresh(self) -> None:
         """Timer callback — perform the actual panel refresh."""
         self._panel_refresh_pending = False
-
-        # Autosave. Only viable now that saving a large project takes
-        # seconds on a worker rather than half a minute on the UI thread.
-        from ..utils.autosave import AutosaveManager, purge_stale_markers
-        purge_stale_markers()
-        self._autosave = AutosaveManager()
-        self._autosave_timer = QTimer(self)
-        self._autosave_timer.setInterval(60_000)   # check once a minute
-        self._autosave_timer.timeout.connect(self._run_autosave)
-        self._autosave_timer.start()
         if self._doc:
             self._layers_panel.refresh(self._doc, thumbnails=False)
             self._transform_panel.refresh(self._doc)

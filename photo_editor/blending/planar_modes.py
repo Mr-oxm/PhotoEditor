@@ -45,9 +45,18 @@ def p_normal(base: np.ndarray, over: np.ndarray) -> np.ndarray:
     return over
 
 
-def p_dissolve(base: np.ndarray, over: np.ndarray) -> np.ndarray:
-    from .normal import _dither_field
-    noise = _dither_field(over.shape[1], over.shape[2])
+def p_dissolve(base: np.ndarray, over: np.ndarray,
+               origin: tuple[int, int] = (0, 0)) -> np.ndarray:
+    """Dissolve, dithered against the global pattern at *origin*.
+
+    *origin* is the absolute document position of this block. Without it the
+    pattern would be generated per region, so a band-parallel render and a
+    whole-canvas render of the same document disagreed along band
+    boundaries.
+    """
+    from .normal import dither_for
+    y0, x0 = origin
+    noise = dither_for(y0, x0, over.shape[1], over.shape[2])
     avg = over.mean(axis=0)
     return np.where(noise < avg, over, base)
 
@@ -233,6 +242,11 @@ PLANAR_BLEND_FUNCS = {
     BlendMode.COLOR: p_color,
     BlendMode.LUMINOSITY: p_luminosity,
 }
+
+
+# Modes whose result depends on WHERE the block sits in the document, and
+# which therefore must be handed an absolute origin.
+POSITION_DEPENDENT = frozenset({BlendMode.DISSOLVE})
 
 
 def get_planar_blend_func(mode: BlendMode):

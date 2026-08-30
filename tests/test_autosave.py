@@ -245,3 +245,31 @@ def test_recovery_dialog_lists_and_discards(qtbot):
     dlg._on_discard()
     assert dlg._list.count() == 0
     assert A.find_recoverable() == []
+
+
+def test_panel_refresh_does_not_recreate_the_autosave_manager(qtbot):
+    """The autosave bootstrap was pasted into _do_deferred_panel_refresh as
+    well as __init__, so every panel refresh -- roughly five a second during
+    a drag -- leaked a QTimer, an AutosaveManager and a .live marker file."""
+    from PySide6.QtCore import QTimer
+
+    from photo_editor.ui.main_window import MainWindow
+
+    win = MainWindow(dev_mode=True)
+    qtbot.addWidget(win)
+    try:
+        manager = win._autosave
+        timers = len([c for c in win.children() if isinstance(c, QTimer)])
+        markers = len(list(A.recovery_dir().glob(f"*{A._LIVE_SUFFIX}")))
+
+        for _ in range(20):
+            win._do_deferred_panel_refresh()
+
+        assert win._autosave is manager, "autosave manager was recreated"
+        assert len([c for c in win.children() if isinstance(c, QTimer)]) == timers, (
+            "panel refresh leaked QTimers")
+        assert len(list(A.recovery_dir().glob(f"*{A._LIVE_SUFFIX}"))) == markers, (
+            "panel refresh leaked session marker files")
+    finally:
+        win._autosave_timer.stop()
+        win._doc.mark_clean()

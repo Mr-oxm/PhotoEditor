@@ -55,10 +55,16 @@ class ParallelCompositor:
         cache=None,
         max_workers: int | None = None,
         band_height: int = DEFAULT_BAND_HEIGHT,
+        min_parallel_pixels: int = MIN_PARALLEL_PIXELS,
     ) -> None:
         cpu = os.cpu_count() or 4
         self._max_workers = max_workers or min(DEFAULT_MAX_WORKERS, cpu)
         self._band_height = band_height
+        # Overridable so tests can force the banded path. The reference
+        # scenes are 160x120, far below the production threshold, so with
+        # the constant hard-coded every "parallel" test silently ran the
+        # serial path and the thread-local compositor fix was unexercised.
+        self._min_parallel_pixels = min_parallel_pixels
         self._cache = cache
         # One compositor per *thread*, not per band. A compositor carries
         # mutable per-composite state (band origin, mip level, frame ROI,
@@ -108,7 +114,7 @@ class ParallelCompositor:
         if out is None:
             out = np.zeros((4, height, width), dtype=np.float32)
 
-        if (width * height < MIN_PARALLEL_PIXELS
+        if (width * height < self._min_parallel_pixels
                 or self._max_workers <= 1
                 or height <= self._band_height
                 or self._would_thrash(stack, width, height)):
