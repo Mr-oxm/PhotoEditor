@@ -159,6 +159,8 @@ class BrushTool(Tool):
     # ------------------------------------------------------------------
     # Tool interface
     # ------------------------------------------------------------------
+        layer.touch()
+
 
     def on_press(self, doc: Document, x: int, y: int, pressure: float = 1.0) -> None:
         self._rasterize_if_needed(doc)

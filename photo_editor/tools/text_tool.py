@@ -537,6 +537,7 @@ class TextTool(Tool):
         # Paste rendered text
         ph, pw = min(rh, need_h), min(rw, need_w)
         layer._pixels[:ph, :pw] = rendered[:ph, :pw]
+        layer.touch()
 
     def _re_render_text(self) -> None:
         """Re-render the current editing text layer."""

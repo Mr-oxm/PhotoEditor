@@ -61,6 +61,10 @@ class Layer:
     transform_base_h: int = 0
 
     def __post_init__(self) -> None:
+        # Monotonic counter bumped whenever pixel/mask content changes.
+        # The render pipeline's layer cache keys off this, so any code path
+        # that mutates pixels in place must call touch().
+        self._content_version: int = 0
         self._pixels = np.zeros((self.height, self.width, 4), dtype=np.float32)
         self._mask: np.ndarray | None = None
         self._styles: list = []
@@ -95,6 +99,23 @@ class Layer:
     def pixels(self, value: np.ndarray) -> None:
         self._pixels = value.astype(np.float32) if value.dtype != np.float32 else value
         self.height, self.width = value.shape[:2]
+        self._content_version += 1
+
+    # ---- Content versioning -------------------------------------------------
+
+    @property
+    def content_version(self) -> int:
+        """Bumped on every content change; the render cache keys off it."""
+        return self._content_version
+
+    def touch(self) -> None:
+        """Signal that pixel or mask data was mutated in place.
+
+        Painting tools write directly into ``layer.pixels[y0:y1, x0:x1]``,
+        which the property setter never sees. They must call this so cached
+        renders of the layer are dropped.
+        """
+        self._content_version += 1
 
     # ---- Non-destructive transform API --------------------------------------
 
@@ -194,6 +215,7 @@ class Layer:
             self._mask = np.clip(mask_result, 0.0, 1.0)
         self.height, self.width = result.shape[:2]
         self._pixels_dirty = False
+        self._content_version += 1
 
     def invalidate_transform(self) -> None:
         """Mark display pixels as needing lazy recompute from source."""
@@ -236,13 +258,16 @@ class Layer:
     @mask.setter
     def mask(self, value: np.ndarray | None) -> None:
         self._mask = value
+        self._content_version += 1
 
     def add_mask(self, fill_white: bool = True) -> None:
         val = 1.0 if fill_white else 0.0
         self._mask = np.full((self.height, self.width), val, dtype=np.float32)
+        self._content_version += 1
 
     def remove_mask(self) -> None:
         self._mask = None
+        self._content_version += 1
 
     # ---- Styles / Adjustments ----------------------------------------------
 
@@ -328,3 +353,4 @@ class Layer:
 
     def fill(self, color: np.ndarray) -> None:
         self._pixels[:] = color.astype(np.float32)
+        self._content_version += 1

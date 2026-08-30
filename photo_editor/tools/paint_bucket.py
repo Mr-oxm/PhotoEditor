@@ -81,6 +81,7 @@ class PaintBucketTool(Tool):
             mask *= sel_mask
         mask = mask[..., np.newaxis] * self.opacity
         layer.pixels[:] = layer.pixels * (1 - mask) + self.color * mask
+        layer.touch()
         np.clip(layer.pixels, 0, 1, out=layer.pixels)
 
     def on_move(self, doc: Document, x: int, y: int, pressure: float = 1.0) -> None:

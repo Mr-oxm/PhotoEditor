@@ -416,6 +416,7 @@ class Document:
         # Combine this mask layer's grayscale into the parent's alpha
         grayscale = mask_layer.get_mask_grayscale()
         parent.pixels[..., 3] *= grayscale
+        parent.touch()
         self.layers.remove_mask_layer(mask_layer_id)
         self._snapshot("Apply Mask Layer")
         self._dirty = True

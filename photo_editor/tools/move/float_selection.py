@@ -56,6 +56,7 @@ class FloatSelectionMixin:
         total_dy = self._float_committed_dy
         # Restore base-with-hole, then composite float at final position
         layer.pixels[:] = self._float_base
+        layer.touch()
         self._composite_float(layer.pixels, total_dx, total_dy)
         # Translate the selection mask to follow the float's final position
         if doc is not None and doc.selection.active and (total_dx != 0 or total_dy != 0):

@@ -30,6 +30,7 @@ class MaskManager:
         """Burn the mask into the alpha channel permanently."""
         if layer.mask is not None:
             layer.pixels[..., 3] *= layer.mask
+            layer.touch()
             layer.remove_mask()
 
     @staticmethod
@@ -101,6 +102,7 @@ class MaskManager:
         """Invert a MASK layer's pixel data (white ↔ black)."""
         if layer.layer_type == LayerType.MASK:
             layer._pixels[..., :3] = 1.0 - layer._pixels[..., :3]
+            layer.touch()
 
     @staticmethod
     def fill_mask_layer(layer: Layer, value: float = 1.0) -> None:
@@ -108,6 +110,7 @@ class MaskManager:
         if layer.layer_type == LayerType.MASK:
             layer._pixels[..., :3] = value
             layer._pixels[..., 3] = 1.0
+            layer.touch()
 
     @staticmethod
     def get_combined_mask(layer: Layer, stack) -> np.ndarray | None:

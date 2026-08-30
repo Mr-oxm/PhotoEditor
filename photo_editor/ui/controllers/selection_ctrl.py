@@ -123,6 +123,7 @@ class SelectionController(ControllerBase):
         layer_mask = self.extract_layer_mask(mask, lx, ly, w, h)
         if layer_mask is not None:
             layer.pixels[..., 3] *= (1.0 - layer_mask)
+            layer.touch()
         self.ctx.refresh()
 
     def on_fill_selection(self, which: str) -> None:
@@ -152,8 +153,10 @@ class SelectionController(ControllerBase):
                         layer.pixels[..., c] * (1.0 - layer_mask)
                         + color[c] * layer_mask
                     )
+                layer.touch()
         else:
             layer.pixels[..., :] = color
+            layer.touch()
         self.ctx.refresh()
 
     def on_cut(self) -> None:
