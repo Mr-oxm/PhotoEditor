@@ -199,17 +199,78 @@ class TestV3Format:
         with zipfile.ZipFile(p) as zf:
             manifest = json.loads(zf.read("manifest.json"))
         assert manifest["magic"] == "BASERA_PROJECT"
-        assert manifest["version"] == 3
+        assert manifest["version"] == 4
 
-    def test_layer_pixels_stored_as_npy(self, tmp_path):
+    def test_layer_pixels_stored_as_compressed_npy(self, tmp_path):
+        """v4 stores zlib-compressed .npy payloads in an uncompressed ZIP."""
         from photo_editor.utils.project_io import save_basera_project
         doc = _make_document()
-        layer = doc.add_layer(name="Raster")
+        doc.add_layer(name="Raster")
         p = tmp_path / "test.basera"
         save_basera_project(doc, p)
         with zipfile.ZipFile(p) as zf:
-            npy_entries = [n for n in zf.namelist() if n.endswith(".npy")]
-        assert len(npy_entries) >= 1, "Pixel data must be stored as .npy files"
+            entries = [n for n in zf.namelist() if n.endswith(".npy.z")]
+            assert entries, "pixel data must be stored as .npy.z entries"
+            for info in zf.infolist():
+                if info.filename.endswith(".npy.z"):
+                    assert info.compress_type == zipfile.ZIP_STORED, (
+                        "payloads are already zlib-compressed; the container "
+                        "must not compress them again")
+
+    def test_pixels_stored_as_uint16(self, tmp_path):
+        """float32 image data is 4x larger than needed and barely
+        compressible; uint16 is effectively lossless for [0, 1] data."""
+        import io
+        import zlib
+        import numpy as np
+        from photo_editor.utils.project_io import save_basera_project
+        doc = _make_document()
+        layer = doc.add_layer(name="Raster")
+        _fill_pixels(layer)
+        p = tmp_path / "test.basera"
+        save_basera_project(doc, p)
+        with zipfile.ZipFile(p) as zf:
+            name = next(n for n in zf.namelist()
+                        if n.endswith(f"{layer.id}.npy.z"))
+            arr = np.load(io.BytesIO(zlib.decompress(zf.read(name))))
+        assert arr.dtype == np.uint16, f"stored as {arr.dtype}, expected uint16"
+
+    def test_out_of_range_pixels_are_stored_losslessly(self, tmp_path):
+        """Values outside [0, 1] must not be silently clipped by quantising."""
+        import numpy as np
+        from photo_editor.utils.project_io import (
+            load_basera_project, save_basera_project,
+        )
+        doc = _make_document()
+        layer = doc.add_layer(name="HDR")
+        px = np.zeros((layer.height, layer.width, 4), dtype=np.float32)
+        px[..., 0] = 3.5          # deliberately out of range
+        px[..., 3] = 1.0
+        layer.pixels = px
+        p = tmp_path / "hdr.basera"
+        save_basera_project(doc, p)
+        loaded = load_basera_project(p)
+        rl = next(l for l in loaded.layers if l.name == "HDR")
+        assert np.allclose(rl.pixels[..., 0], 3.5, atol=1e-5), (
+            "out-of-range data was clipped by quantisation")
+
+    def test_uint16_round_trip_is_visually_lossless(self, tmp_path):
+        import numpy as np
+        from photo_editor.utils.project_io import (
+            load_basera_project, save_basera_project,
+        )
+        rng = np.random.default_rng(0)
+        doc = _make_document()
+        layer = doc.add_layer(name="Noise")
+        px = rng.random((layer.height, layer.width, 4)).astype(np.float32)
+        layer.pixels = px
+        p = tmp_path / "noise.basera"
+        save_basera_project(doc, p)
+        loaded = load_basera_project(p)
+        rl = next(l for l in loaded.layers if l.name == "Noise")
+        err = float(np.abs(rl.pixels - px).max())
+        assert err < 1.0 / 255.0 / 100.0, (
+            f"round-trip error {err:.8f} exceeds 1% of an 8-bit level")
 
     def test_no_history_in_manifest(self, tmp_path):
         import json

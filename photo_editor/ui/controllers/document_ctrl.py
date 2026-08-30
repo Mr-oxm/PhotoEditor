@@ -215,39 +215,86 @@ class DocumentController(ControllerBase):
             self._save_basera(path)
 
     def _save_basera(self, path: str) -> None:
-        """Save the project to *path* synchronously.
+        """Save the project to *path* without blocking the UI.
 
-        The v3 ZIP format is fast enough to run on the main thread —
-        no background worker, no signal race conditions, no callbacks.
+        Saving used to run inline on the main thread. For a 20-layer 4K
+        project that measured 32 s of DEFLATE with the whole window frozen
+        and the status message unable to repaint. The v4 format cut the
+        work substantially, but a large project is still seconds of I/O, so
+        it belongs on a worker.
+
+        The document is not mutated during the save, and the layer buffers
+        it reads are frozen by the undo system's copy-on-write, so an edit
+        made while a save is running copies rather than overwriting the
+        bytes being written.
         """
         if not self.doc:
             return
         from ...utils.project_io import save_basera_project
+        from ...utils.worker import Worker
+
+        if getattr(self, "_saving", False):
+            self.ctx.show_status_message("A save is already in progress…", 2000)
+            return
+        self._saving = True
+
+        doc = self.doc
+        name = Path(path).name
+        self.ctx.show_status_message(f"Saving {name}…", 0)
+
+        def run() -> str:
+            save_basera_project(doc, path)
+            return path
+
+        def on_result(_result) -> None:
+            self._saving = False
+            self._after_save_succeeded(doc, path)
+
+        def on_error(message: str) -> None:
+            self._saving = False
+            self.ctx.show_status_message("Save failed", 3000)
+            QMessageBox.warning(self.mw, "Save Error", str(message))
+
+        Worker.run_async(run, on_result=on_result, on_error=on_error)
+
+    def _after_save_succeeded(self, doc, path: str) -> None:
+        """UI bookkeeping once a background save has completed."""
         from ...utils.recent_projects import add_recent_project
 
-        self.ctx.show_status_message(f"Saving {Path(path).name}…", 0)
+        doc.file_path = path
+        doc.mark_clean()
+        self.ctx.set_window_title(f"Basera — {Path(path).name}")
+        idx = self._session.current_index()
+        if idx >= 0:
+            self._session.update_path(idx, path)
+            self._session.update_tab_metadata(
+                idx, title=Path(path).name, tooltip=path,
+            )
         try:
-            save_basera_project(self.doc, path)
+            add_recent_project(path)
+            if hasattr(self.mw, '_refresh_recent_projects'):
+                self.mw._refresh_recent_projects()
+        except Exception:
+            pass
+        self.ctx.show_status_message(f"Saved {Path(path).name}", 2000)
 
-            self.doc.file_path = path
-            self.doc.mark_clean()
-            self.ctx.set_window_title(f"Basera — {Path(path).name}")
-            idx = self._session.current_index()
-            if idx >= 0:
-                self._session.update_path(idx, path)
-                self._session.update_tab_metadata(
-                    idx, title=Path(path).name, tooltip=path,
-                )
-            try:
-                add_recent_project(path)
-                if hasattr(self.mw, '_refresh_recent_projects'):
-                    self.mw._refresh_recent_projects()
-            except Exception:
-                pass
-            self.ctx.show_status_message(f"Saved {Path(path).name}", 2000)
-        except Exception as exc:
-            self.ctx.show_status_message("Save failed", 3000)
+    def _save_basera_blocking(self, doc, path: str) -> bool:
+        """Save *doc* synchronously and report whether it succeeded.
+
+        Used on the quit path, which must not return before the bytes are
+        on disk -- an asynchronous save there would let the process exit
+        mid-write and lose the user's work.
+        """
+        if doc is None:
+            return False
+        from ...utils.project_io import save_basera_project
+        try:
+            save_basera_project(doc, path)
+        except Exception as exc:  # noqa: BLE001
             QMessageBox.warning(self.mw, "Save Error", str(exc))
+            return False
+        self._after_save_succeeded(doc, path)
+        return True
 
     def on_export(self) -> None:
         """Open the export dialog."""
@@ -575,11 +622,14 @@ class DocumentController(ControllerBase):
         return "cancel"
 
     def _save_basera_sync(self, doc) -> bool:
-        """Resolve a save path for *doc* and write it.
+        """Resolve a save path for *doc* and write it, blocking until done.
 
         Uses the document's existing file_path when it is a .basera path;
         otherwise opens a Save As dialog.  Returns True on success,
-        False if the user cancelled or save failed.
+        False if the user cancelled or the save failed.
+
+        This is the quit path: it must block, because returning early would
+        let the application exit while the file is still being written.
         """
         path = doc.file_path if (doc.file_path and doc.file_path.endswith(".basera")) else None
         if not path:
@@ -591,12 +641,7 @@ class DocumentController(ControllerBase):
             if not path.endswith(".basera"):
                 path += ".basera"
 
-        try:
-            self._save_basera(path)
-            return True
-        except Exception as exc:
-            QMessageBox.warning(self.mw, "Save Error", str(exc))
-            return False
+        return self._save_basera_blocking(doc, path)
 
     def on_undo(self) -> None:
         if self.doc:
