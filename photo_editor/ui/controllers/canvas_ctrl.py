@@ -248,14 +248,17 @@ class CanvasController(ControllerBase):
                 mw._canvas.set_lasso_points(list(tool._points))
         elif tool_type in (ToolType.PEN, ToolType.NODE, ToolType.VECTOR_SHAPE):
             mw._canvas.update()
-            if self._dragging:
-                self._sync_snap_lines()
             mw._schedule_render()
         elif tool_type == ToolType.TEXT:
             self.signals.text_overlay_requested.emit()
             if not self._dragging:
                 self.signals.text_hover_cursor_requested.emit(x, y)
         else:
+            # The Move tool lands here, and it is the tool that snaps -- the
+            # alignment lines were previously forwarded only from the vector
+            # branch, which has no snap engine, so they were never drawn.
+            if self._dragging:
+                self._sync_snap_lines()
             mw._schedule_render()
 
     def on_release(self, x: int, y: int) -> None:

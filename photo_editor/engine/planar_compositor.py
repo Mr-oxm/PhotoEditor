@@ -26,20 +26,38 @@ import numpy as np
 from ..blending.planar import (
     PlanarScratch, blend_planar_region, to_interleaved, to_planar,
 )
-from ..core.enums import LayerType
+from ..core.enums import BlendMode, LayerType
 from ..core.layer import Layer
 from ..core.layer_stack import LayerStack
 from ..masks.mask_manager import MaskManager
 from ..styles.style_engine import StyleEngine
+from .sandwich_cache import over_run_is_isolatable
 
 if TYPE_CHECKING:
     from .layer_cache import LayerRasterCache
 
 
+# Sentinel for "the layers below the focus are an empty canvas", which is
+# the case when the focus is the bottom layer. Distinguishes "nothing to
+# copy" from "no cache available".
+_EMPTY_UNDER = object()
+
+
 def _round_half_up(value: float) -> int:
-    """Round .5 away from zero -- translation-invariant, unlike round()."""
-    return int(math.floor(value + 0.5)) if value >= 0 else -int(
-        math.floor(-value + 0.5))
+    """floor(value + 0.5) -- the only form that is translation-invariant.
+
+    Both alternatives fail the property that matters here, f(a + n) ==
+    f(a) + n for integer n, which is what keeps a layer landing on the same
+    output pixel however the viewport crop is placed:
+
+      * Python's round() is banker's: round(2.5) is 2 but round(3.5) is 4.
+      * Rounding half *away from zero* breaks across the origin:
+        f(-0.5) = -1 but f(0.5) = 1, so f(a + 1) != f(a) + 1 at a = -1 --
+        which bites for layers positioned off the top or left of the canvas.
+
+    floor(x + 0.5) holds for every value, positive or negative.
+    """
+    return int(math.floor(value + 0.5))
 
 
 class PlanarCompositor:
@@ -102,8 +120,12 @@ class PlanarCompositor:
         if self._scale == 1.0:
             return arr
         h, w = arr.shape[:2]
-        nw = max(1, int(round(w * self._scale)))
-        nh = max(1, int(round(h * self._scale)))
+        # Same rounding as placement. round() is banker's, so a 25px extent
+        # gave 12 rows and a 27px one gave 14 -- inconsistent box ratios
+        # between a cropped and an uncropped downscale of the same content,
+        # which defeats the grid snapping _crop_to_frame does upstream.
+        nw = max(1, _round_half_up(w * self._scale))
+        nh = max(1, _round_half_up(h * self._scale))
         if nw == w and nh == h:
             return arr
         try:
@@ -433,16 +455,13 @@ class PlanarCompositor:
         # that did not change can be reused. Falls back to a full walk
         # whenever the split is not safe.
         sandwich_plan = self._plan_sandwich(visible, regular_children)
+        over_canvas = None
         if sandwich_plan is not None:
-            under, split_index, over_run, over_key = sandwich_plan
+            under, split_index, over_canvas, over_end = sandwich_plan
             if under is not None:
-                np.copyto(canvas, under)
-                visible = visible[split_index:]
-        else:
-            under = None
-            split_index = 0
-            over_run = []
-            over_key = None
+                if under is not _EMPTY_UNDER:
+                    np.copyto(canvas, under)
+                visible = visible[split_index:over_end]
 
         prev_img: np.ndarray | None = None
         # Keyed by id(): `buf in borrowed` on a list of ndarrays compares
@@ -599,6 +618,13 @@ class PlanarCompositor:
         release_prev(prev_img)
         for buf in borrowed.values():
             self._scratch.release(buf)
+        if over_canvas is not None:
+            # The pre-composited run above the focus, blended back as one
+            # NORMAL layer. Valid because 'over' is associative and the run
+            # was checked to contain nothing that depends on what is beneath.
+            blend_planar_region(canvas, over_canvas, (0, 0),
+                                BlendMode.NORMAL, 1.0,
+                                abs_origin=(self._ox, self._oy))
         if out_buf is not None and canvas is not out_buf:
             np.copyto(out_buf, canvas)
             canvas = out_buf
@@ -615,34 +641,119 @@ class PlanarCompositor:
                 self._ox, self._oy)
 
     def _plan_sandwich(self, visible, regular_children):
-        """Decide whether the layers below the focus can be reused.
+        """Decide which layers around the focus can be reused.
 
-        Returns ``(under_canvas_or_None, split_index, over_run, over_key)``
-        or ``None`` when caching does not apply to this composite.
+        Returns ``(under_canvas_or_None, split_index, over_canvas_or_None,
+        over_end_index)``, or ``None`` when caching does not apply.
+
+        The *under* half -- everything below the focus, composited in order
+        -- is always safe. The *over* half is only safe when the layers
+        above form an isolated run: Porter-Duff 'over' is associative, so a
+        run of NORMAL layers can be pre-composited into one buffer, but a
+        non-NORMAL layer, a clipping mask, or a root adjustment depends on
+        what lies beneath it and must be walked individually.
         """
         cache = self._sandwich
         focus = self.focus_layer_id
         if cache is None or focus is None or len(visible) < 3:
             return None
         index = next((i for i, l in enumerate(visible) if l.id == focus), -1)
-        # A focus at the very bottom has nothing below it worth caching.
-        if index <= 0:
+        if index < 0:
             return None
 
         below = visible[:index]
-        # Any root adjustment or filter below consumes the accumulated
-        # canvas, which is still fine -- it is part of what we cache. But a
-        # clipping-mask chain crossing the split is not: the focus layer
-        # would need the placed pixels of the layer beneath it, which the
-        # cached buffer no longer carries separately.
+        # A clipping-mask chain crossing the split is not cacheable: the
+        # focus layer would need the placed pixels of the layer beneath it,
+        # which a flattened buffer no longer carries separately.
         if visible[index].clipping_mask:
             return None
 
-        key = self._sandwich_key(below)
-        under = cache.get_under(key)
-        if under is None:
-            return (None, 0, [], None)      # nothing cached yet this frame
-        return (under, index, [], None)
+        if index == 0:
+            # Nothing below the focus, so the "under" half is the empty
+            # canvas we already have. The over half can still apply -- and
+            # this is the case that needs it most, since every other layer
+            # in the document sits above the focus.
+            under = _EMPTY_UNDER
+        else:
+            under = cache.get_under(self._sandwich_key(below))
+            if under is None:
+                return (None, 0, None, 0)   # nothing cached yet this frame
+
+        # The run above, if it is isolatable.
+        above = visible[index + 1:]
+        over = None
+        # Rows of `visible` the main loop must still walk. With an over-cache
+        # this is the focus layer alone -- everything above it is already
+        # flattened into that buffer.
+        over_end = len(visible)
+        if above and over_run_is_isolatable(above, regular_children):
+            over = cache.get_over(self._sandwich_key(above))
+            if over is not None:
+                over_end = index + 1
+        return (under, index, over, over_end)
+
+    def prime_sandwich_over(self, stack: LayerStack, width: int, height: int,
+                            focus_layer_id: str, level: int = 0,
+                            origin: tuple[int, int] = (0, 0),
+                            frame_roi=None) -> bool:
+        """Composite and cache the isolated run above *focus_layer_id*.
+
+        Returns True when a usable over-cache exists afterwards.
+        """
+        cache = self._sandwich
+        if cache is None:
+            return False
+        self._ox, self._oy = origin
+        self._level = level
+        self._scale = 1.0 / (1 << level)
+        self._frame_roi = frame_roi
+
+        visible = self._root_draw_list(stack)
+        index = next((i for i, l in enumerate(visible)
+                      if l.id == focus_layer_id), -1)
+        if index < 0:
+            return False
+        above = visible[index + 1:]
+        if not above:
+            return False
+
+        regular_children = self._regular_children_map(stack)
+        if not over_run_is_isolatable(above, regular_children):
+            return False
+
+        key = self._sandwich_key(above)
+        if cache.get_over(key) is not None:
+            return True
+
+        saved_focus = self.focus_layer_id
+        self.focus_layer_id = None
+        try:
+            # Onto a transparent canvas: this is an isolated composite, and
+            # blending it back with NORMAL at full opacity reproduces the
+            # sequential result exactly because 'over' is associative.
+            partial = self._composite_subset(stack, above, width, height,
+                                             level=level, origin=origin,
+                                             frame_roi=frame_roi)
+        finally:
+            self.focus_layer_id = saved_focus
+        cache.put_over(key, partial)
+        return True
+
+    @staticmethod
+    def _regular_children_map(stack: LayerStack) -> dict:
+        """Parent id -> non-mask, non-adjustment children, as composite() sees them."""
+        layers = list(stack)
+        group_ids = {l.id for l in layers if l.layer_type == LayerType.GROUP}
+        mask_ids = {mid for l in layers for mid in l.mask_layers}
+        out: dict = {}
+        for l in layers:
+            if (l.parent_id and l.visible
+                    and l.parent_id not in group_ids
+                    and l.layer_type not in (LayerType.ADJUSTMENT,
+                                             LayerType.FILTER, LayerType.MASK)
+                    and l.id not in mask_ids):
+                out.setdefault(l.parent_id, []).append(l)
+        return out
 
     def prime_sandwich(self, stack: LayerStack, width: int, height: int,
                        focus_layer_id: str, level: int = 0,
@@ -665,7 +776,11 @@ class PlanarCompositor:
         index = next((i for i, l in enumerate(visible)
                       if l.id == focus_layer_id), -1)
         if index <= 0 or len(visible) < 3 or visible[index].clipping_mask:
-            cache.clear()
+            # No under-half is possible here (the focus is at the bottom, or
+            # a clipping chain crosses the split). Do NOT clear the cache:
+            # the over-half may still be valid and useful, and wiping it
+            # every frame made dragging the bottom layer recomposite the
+            # whole stack above it -- worse than no caching at all.
             return False
 
         below = visible[:index]

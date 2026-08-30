@@ -435,7 +435,18 @@ class MainWindow(QMainWindow):
         self._view_ctrl.update_rulers()
         self._status.set_zoom(self._canvas.zoom)
         self._sync_canvas_scrollbars()
+        previous = (self._render_scheduler.preview_max_size,
+                    self._render_scheduler._roi)
         self._sync_preview_level()
+        current = (self._render_scheduler.preview_max_size,
+                   self._render_scheduler._roi)
+        # Rendering is now scoped to the visible region at a zoom-dependent
+        # mip level, so panning and zooming change WHAT must be composited --
+        # not just how it is drawn. Without a new frame the canvas keeps
+        # showing the region that was visible before the view moved.
+        if current != previous and self._doc is not None:
+            self._pipeline.invalidate()
+            self._render_scheduler.enqueue_render(self._doc)
 
     def _sync_canvas_scrollbars(self) -> None:
         span_x, span_y = self._canvas.scrollable_span()

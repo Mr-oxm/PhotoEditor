@@ -23,10 +23,11 @@ VIEWPORT = 1536
 
 
 def run(report: Report, counts, iterations: int) -> None:
-    print(f"\n=== 4K document, preview_max_size={VIEWPORT} ===")
-    print(f"  {'layers':>6} {'full-res':>11} {'rebuild':>11} {'drag':>11} "
-          f"{'fps':>6} {'cache':>10} {'lvl':>4}")
-    print("  " + "-" * 68)
+    print(f"\n=== 4K document, preview target {VIEWPORT}px (all times in ms) ===")
+    print(f"  {'layers':>6} {'full-res':>9} {'rebuild':>8} "
+          f"{'drag-top':>7} {'drag-mid':>7} {'drag-bot':>8} "
+          f"{'mousedown':>8} {'cache':>7}")
+    print("  " + "-" * 72)
     for n in counts:
         doc = make_document(n, 3840, 2160)
 
@@ -58,30 +59,50 @@ def run(report: Report, counts, iterations: int) -> None:
         del pipe
         gc.collect()
 
-        # Interactive: dragging the top layer, with the sandwich cache on.
-        pipe = RenderPipeline(cache_budget_mb=1024)
-        focus = doc.layers.layers[-1]
-        pipe.begin_interaction(focus.id)
-        def drag():
-            focus.position = (focus.position[0] + 1, focus.position[1])
+        # Interactive drag, measured at three depths in the stack. The
+        # sandwich cache covers everything BELOW the focus, so dragging the
+        # top layer is its best case and dragging the bottom one its worst.
+        # Reporting only the top layer would flatter the result.
+        drag_times = {}
+        prime_ms = None
+        for label, index in (("top", -1), ("mid", n // 2), ("bottom", 0)):
+            pipe = RenderPipeline(cache_budget_mb=1024)
+            focus = doc.layers.layers[index]
+
+            # Cost of entering the interaction: the under-half is composited
+            # once at mouse-down. This is a real hitch the user feels.
+            pipe.begin_interaction(focus.id)
             pipe.invalidate(focus.id)
+            t0 = time.perf_counter()
             pipe.execute_to_uint8(doc, level=level)
-        drag(); drag()
-        pipe.sandwich.reset_stats()
-        t_drag = timeit(f"drag_{n}L", drag, iterations=iterations)
-        sw = pipe.sandwich.stats()
-        pipe.shutdown()
+            first = (time.perf_counter() - t0) * 1000
+            if label == "mid":
+                prime_ms = first
+
+            def drag(_p=pipe, _f=focus):
+                _f.position = (_f.position[0] + 1, _f.position[1])
+                _p.invalidate(_f.id)
+                _p.execute_to_uint8(doc, level=level)
+            drag(); drag()
+            t = timeit(f"drag_{label}_{n}L", drag, iterations=iterations)
+            drag_times[label] = t.median_ms
+            report.add(t, layers=n, mode=f"drag-{label}",
+                       first_frame_ms=round(first, 1))
+            pipe.shutdown()
+            del pipe
+            gc.collect()
+
+        t_drag = type("T", (), {"median_ms": drag_times["mid"]})()
+        sw = {"hit_rate": 0.0, "mb": 0.0}
 
         report.add(t_prev, layers=n, mode="preview", level=level,
                    cache_mb=stats["mb"], hit_rate=stats["hit_rate"])
-        report.add(t_drag, layers=n, mode="drag",
-                   sandwich_hit_rate=sw["hit_rate"], sandwich_mb=sw["mb"])
         report.add(t_full, layers=n, mode="full")
-        ow, oh = level_size(3840, 2160, level)
-        print(f"  {n:>6} {t_full.median_ms:9.1f} ms {t_prev.median_ms:9.1f} ms "
-              f"{t_drag.median_ms:8.1f} ms {1000/t_drag.median_ms:6.0f} "
-              f"{stats['mb']:7.0f} MB {level:>3}")
-        del doc, pipe
+        print(f"  {n:>6} {t_full.median_ms:9.1f} {t_prev.median_ms:8.1f} "
+              f"{drag_times['top']:7.1f} {drag_times['mid']:7.1f} "
+              f"{drag_times['bottom']:8.1f} {prime_ms:8.1f} "
+              f"{stats['mb']:7.0f}")
+        del doc
         gc.collect()
 
 

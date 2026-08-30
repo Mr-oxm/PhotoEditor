@@ -125,6 +125,9 @@ class RenderPipeline:
             self._interactive.prime_sandwich(
                 document.layers, cw, ch, self._focus_layer_id,
                 level=level, origin=origin, frame_roi=lroi)
+            self._interactive.prime_sandwich_over(
+                document.layers, cw, ch, self._focus_layer_id,
+                level=level, origin=origin, frame_roi=lroi)
         except Exception:
             # Caching is an optimisation: never let it break a render.
             self._sandwich.clear()
