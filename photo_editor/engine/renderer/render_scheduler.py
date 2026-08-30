@@ -198,9 +198,8 @@ class RenderScheduler(QObject):
         # NOT adopted -- it may be the pipeline's internal buffer.
         if isinstance(rgba, np.ndarray) and rgba.dtype == np.uint8:
             shape = (rgba.shape[0], rgba.shape[1], rgba.shape[2])
-            if self._buffer_shape != shape:
-                self._buffer_shape = shape
-                self._buffers = [None, None]
+            self._buffer_shape = shape
+            self._buffers = [rgba, rgba]  # REGRESSION: both slots alias
         if generation_id >= self._last_shown_generation:
             self._last_shown_generation = generation_id
             self.render_ready.emit(rgba, generation_id, full_refresh,

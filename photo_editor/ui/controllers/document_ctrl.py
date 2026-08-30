@@ -255,6 +255,10 @@ class DocumentController(ControllerBase):
         # during a multi-second save must NOT be marked saved when it
         # finishes, or the user quits without a prompt and loses them.
         token = _document_revision(doc)
+        # The worker reads these buffers for several seconds while the user
+        # keeps painting. Freezing makes the next edit copy-on-write instead
+        # of mutating underneath the writer.
+        doc.freeze_for_read()
         self.ctx.show_status_message(f"Saving {name}…", 0)
 
         def run() -> str:

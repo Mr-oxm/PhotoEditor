@@ -290,3 +290,24 @@ def test_undo_after_a_restore_and_further_edits_is_correct():
     doc.undo()
     assert np.allclose(doc.layers.layers[1].pixels, 0.1), (
         "the snapshot after a restore stored the wrong branch's pixels")
+
+
+def test_selection_snapshots_are_keyed_on_version_not_address():
+    """CPython reuses the addresses of freed ndarrays. Keying the shared
+    selection snapshot on id(mask) meant a new selection could land on the
+    old one's address, and the snapshot silently stored -- and restored --
+    the previous selection."""
+    doc = _doc(2)
+    doc.selection.select_rect(0, 0, 10, 10)
+    doc.save_snapshot("first selection")
+    first = doc.history.states[-1].layer_data["__selection_mask__"]
+
+    doc.selection.deselect()
+    doc.selection.select_rect(30, 20, 12, 12)
+    doc.save_snapshot("second selection")
+    second = doc.history.states[-1].layer_data["__selection_mask__"]
+
+    assert second is not first, "the second snapshot reused the first mask"
+    assert not np.array_equal(second, first)
+    # The stored mask must be the one that was actually selected.
+    assert second[25, 35] > 0.5 and second[5, 5] < 0.5

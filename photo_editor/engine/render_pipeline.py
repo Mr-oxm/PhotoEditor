@@ -14,6 +14,8 @@ mutated ``_uint8_buf``, the tile cache and the compositor's scratch pool.
 
 from __future__ import annotations
 
+from collections import OrderedDict
+
 import numpy as np
 
 from ..blending.planar import to_interleaved
@@ -308,16 +310,24 @@ def _planar_to_uint8(planar: np.ndarray, out: np.ndarray) -> None:
     cv2.merge(planes, out)
 
 
-_PLANE_CACHE: dict[tuple[int, int], list] = {}
+_PLANE_CACHE: "OrderedDict[tuple[int, int], list]" = OrderedDict()
+# Bounded by bytes, not entry count: four entries is 132 MB at 4K but
+# 1.5 GB for a 12000x8000 scan, and these are module globals that never go
+# away.
+_PLANE_CACHE_MAX_BYTES = 64 << 20
 
 
 def _uint8_plane_buffers(height: int, width: int) -> list:
     """Reusable single-channel scratch planes, so the hot path allocates none."""
     key = (height, width)
     planes = _PLANE_CACHE.get(key)
-    if planes is None:
-        planes = [np.empty((height, width), dtype=np.uint8) for _ in range(4)]
-        if len(_PLANE_CACHE) > 4:
-            _PLANE_CACHE.pop(next(iter(_PLANE_CACHE)))
-        _PLANE_CACHE[key] = planes
+    if planes is not None:
+        _PLANE_CACHE.move_to_end(key)
+        return planes
+    planes = [np.empty((height, width), dtype=np.uint8) for _ in range(4)]
+    _PLANE_CACHE[key] = planes
+    held = sum(h * w * 4 for (h, w) in _PLANE_CACHE)
+    while held > _PLANE_CACHE_MAX_BYTES and len(_PLANE_CACHE) > 1:
+        (h, w), _ = _PLANE_CACHE.popitem(last=False)
+        held -= h * w * 4
     return planes

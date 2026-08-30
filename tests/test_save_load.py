@@ -877,3 +877,47 @@ class TestSaveDirtyTracking:
             assert not doc.dirty
         finally:
             win._doc.mark_clean()
+
+
+def test_editing_during_a_save_does_not_tear_the_file(tmp_path):
+    """A background save reads layer pixels for seconds while the user keeps
+    painting. Painting writes in place, so the file could contain
+    half-finished strokes. Freezing before the save makes the next edit
+    copy-on-write instead of mutating underneath the writer."""
+    import numpy as np
+    from photo_editor.utils.project_io import (
+        load_basera_project, save_basera_project,
+    )
+
+    doc = _make_document()
+    layer = doc.add_layer(name="Painted")
+    layer.pixels[:] = np.array([0.25, 0.25, 0.25, 1.0], dtype=np.float32)
+
+    doc.freeze_for_read()
+    # Exactly what a save worker holds: a reference to the live array.
+    writer_sees = layer.pixels
+    expected = writer_sees.copy()
+    assert not writer_sees.flags.writeable, "freeze_for_read did not freeze"
+
+    # A stroke lands "during" the save.
+    layer.begin_write()
+    layer.pixels[:] = np.array([0.9, 0.1, 0.1, 1.0], dtype=np.float32)
+
+    np.testing.assert_array_equal(
+        writer_sees, expected,
+        "the buffer a save worker is reading was mutated in place")
+    assert layer.pixels is not writer_sees, "begin_write did not un-share"
+
+    target = tmp_path / "torn.basera"
+    save_basera_project(doc, target)
+    loaded = load_basera_project(target)
+    assert any(l.name == "Painted" for l in loaded.layers)
+
+
+def test_freeze_for_read_does_not_add_history(tmp_path):
+    """Freezing is not a snapshot -- it must not grow the undo stack."""
+    doc = _make_document()
+    doc.add_layer(name="L")
+    before = len(doc.history.states)
+    doc.freeze_for_read()
+    assert len(doc.history.states) == before

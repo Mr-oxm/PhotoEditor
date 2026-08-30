@@ -556,14 +556,35 @@ class Document:
             # Selection has no copy-on-write hook and mutates in place, so
             # this one is still copied -- it is a single-channel mask, ~1/16
             # the cost of a layer.
+            # Keyed on the selection's version, not id(sel_mask): CPython
+            # reuses the addresses of freed ndarrays, so a new selection
+            # could land on the old one's address and the snapshot would
+            # silently share -- and restore -- the *previous* selection.
+            version = self.selection.version
             prev_sel = prev.layer_data.get("__selection_mask__") if prev else None
             prev_ver = prev.layer_versions.get("__selection_mask__") if prev else None
-            if prev_sel is not None and prev_ver == id(sel_mask):
+            if prev_sel is not None and prev_ver == version:
                 state.layer_data["__selection_mask__"] = prev_sel
             else:
                 state.layer_data["__selection_mask__"] = sel_mask.copy()
-            state.layer_versions["__selection_mask__"] = id(sel_mask)
+            state.layer_versions["__selection_mask__"] = version
         return state
+
+    def freeze_for_read(self) -> None:
+        """Mark every layer's buffers read-only without touching history.
+
+        A background save reads layer pixels for several seconds while the
+        user keeps painting. Painting writes in place, so the file could
+        contain half-finished strokes -- or, because the saver scans each
+        array's min/max to decide whether to quantise, a buffer that changed
+        between the scan and the write.
+
+        Freezing reuses the copy-on-write machinery the undo system already
+        relies on: the reader sees stable arrays, and the next edit takes a
+        private copy rather than mutating underneath it.
+        """
+        for layer in self.layers:
+            layer.freeze()
 
     def live_buffer_ids(self) -> set[int]:
         """Identities of every array the live layer stack currently holds.
