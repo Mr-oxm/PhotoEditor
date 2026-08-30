@@ -6,6 +6,7 @@ from PySide6.QtCore import Qt, QSize, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
+    QLineEdit,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -20,6 +21,7 @@ from PySide6.QtWidgets import (
 
 from ....core.document import Document
 from ....core.enums import BlendMode, LayerType
+from ....core.layer_filter import LayerFilter, match_count, visible_layer_ids
 from ...styles import render_qss, themed_value
 
 from .base import (
@@ -84,6 +86,9 @@ class LayersPanel(QWidget):
         self._refreshing = False
         self._row_layer_ids: list[str] = []
         self._row_structure: list[tuple] = []
+        # Layers-panel search. A twenty-layer project is where scrolling
+        # stops being a way to find anything.
+        self._filter = LayerFilter()
         self._collapsed_groups: set[str] = set()
         self._collapsed_masks: set[str] = set()
         self._build_ui()
@@ -137,8 +142,7 @@ class LayersPanel(QWidget):
 
         # Trigger item rebuild on theme change if document is valid
         if self._doc and hasattr(self, '_list'):
-            self._row_structure = []  # Force full rebuild for layer items
-            self.refresh(self._doc, thumbnails=True)
+            self.refresh(self._doc, thumbnails=True, force=True)
             self._sync_active(self._doc)
 
     def _build_ui(self) -> None:
@@ -201,6 +205,35 @@ class LayersPanel(QWidget):
         self._opacity_slider.setValue(100)
         self._opacity_slider.valueChanged.connect(self._on_opacity_slider_changed)
         header_layout.addWidget(self._opacity_slider)
+
+        # --- Search row -------------------------------------------------
+        search_row = QHBoxLayout()
+        search_row.setContentsMargins(0, 0, 0, 0)
+        search_row.setSpacing(4)
+
+        self._search = QLineEdit()
+        self._search.setPlaceholderText("Search layers…")
+        self._search.setClearButtonEnabled(True)
+        self._search.textChanged.connect(self._on_filter_text)
+        search_row.addWidget(self._search, 1)
+
+        self._kind_combo = QComboBox()
+        self._kind_combo.addItem("All kinds", "")
+        for key, label in (
+            ("raster", "Raster"), ("text", "Text"), ("shape", "Shape"),
+            ("adjustment", "Adjustment"), ("filter", "Filter"),
+            ("group", "Group"), ("mask", "Mask"),
+        ):
+            self._kind_combo.addItem(label, key)
+        self._kind_combo.setFixedWidth(104)
+        self._kind_combo.currentIndexChanged.connect(self._on_filter_kind)
+        search_row.addWidget(self._kind_combo)
+
+        header_layout.addLayout(search_row)
+
+        self._filter_status = QLabel("")
+        self._filter_status.setVisible(False)
+        header_layout.addWidget(self._filter_status)
 
         root.addWidget(self._header)
         self._sep1 = h_separator()
@@ -302,11 +335,61 @@ class LayersPanel(QWidget):
 
         root.addWidget(self._toolbar)
 
-    def refresh(self, document: Document, *, thumbnails: bool = True) -> None:
+    # ---- Filtering ---------------------------------------------------
+
+    def _on_filter_text(self, text: str) -> None:
+        self._filter.text = text
+        self._apply_filter()
+
+    def _on_filter_kind(self, _index: int) -> None:
+        kind = self._kind_combo.currentData() or ""
+        self._filter.kinds = {kind} if kind else set()
+        self._apply_filter()
+
+    def _apply_filter(self) -> None:
+        """Rebuild the panel for the current query."""
+        if self._doc is None:
+            return
+        self.refresh(self._doc, thumbnails=True, force=True)
+        if self._filter.is_active:
+            hits = match_count(self._doc, self._filter)
+            total = len(self._doc.layers.layers)
+            self._filter_status.setText(
+                f"{hits} of {total} layers match"
+                if hits else "No layers match")
+            self._filter_status.setVisible(True)
+        else:
+            self._filter_status.setVisible(False)
+
+    @property
+    def layer_filter(self) -> LayerFilter:
+        return self._filter
+
+    def clear_filter(self) -> None:
+        self._search.clear()
+        self._kind_combo.setCurrentIndex(0)
+        self._filter.clear()
+        self._apply_filter()
+
+    def refresh(self, document: Document, *, thumbnails: bool = True,
+                force: bool = False) -> None:
+        """Sync the panel with *document*.
+
+        *force* rebuilds the rows even when the structure is unchanged.
+        Callers used to signal that by clearing ``_row_structure``, which
+        silently failed when the *new* structure was also empty -- as it is
+        when a filter matches nothing, so the panel kept showing every
+        layer.
+        """
         self._doc = document
         self._refreshing = True
 
-        display_order = self._build_display_order(document, self._collapsed_groups, self._collapsed_masks)
+        allowed = visible_layer_ids(document, self._filter)
+        # While filtering, groups are shown expanded: collapsing away the
+        # very rows the query selected would be perverse.
+        collapsed = set() if allowed is not None else self._collapsed_groups
+        display_order = self._build_display_order(
+            document, collapsed, self._collapsed_masks, allowed=allowed)
         new_ids: list[str] = []
         new_structure: list[tuple] = []
         for entry in display_order:
@@ -316,7 +399,7 @@ class LayersPanel(QWidget):
             else:
                 new_ids.append(entry[0].id)
                 new_structure.append((entry[0].id, entry[1], entry[0].parent_id))
-        structure_changed = (new_structure != self._row_structure)
+        structure_changed = force or (new_structure != self._row_structure)
 
         if not structure_changed and not thumbnails:
             self._sync_row_states(document)
@@ -557,10 +640,13 @@ class LayersPanel(QWidget):
     def _build_display_order(
         document: Document, collapsed: set[str],
         masks_collapsed: set[str] | None = None,
+        allowed: set[str] | None = None,
     ) -> list[tuple]:
         if masks_collapsed is None:
             masks_collapsed = set()
         layers = list(document.layers)
+        if allowed is not None:
+            layers = [l for l in layers if l.id in allowed]
         children_of: dict[str, list] = {}
         mask_children_of: dict[str, list] = {}
         adj_children_of: dict[str, list] = {}
