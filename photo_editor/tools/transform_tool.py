@@ -68,7 +68,7 @@ class TransformTool(Tool):
             a1 = math.atan2(y - self._center_y, x - self._center_x)
             delta = math.degrees(a1 - a0)
             layer.transform_angle = self._base_angle + delta
-            layer.compute_display()
+            layer.compute_display(fast=True)
             layer.position = (int(self._center_x - layer.width / 2),
                               int(self._center_y - layer.height / 2))
 
@@ -84,7 +84,7 @@ class TransformTool(Tool):
             layer.transform_scale_x = self._base_scale_x * s
             layer.transform_scale_y = self._base_scale_y * s
             layer.transform_angle = self._base_angle + delta
-            layer.compute_display()
+            layer.compute_display(fast=True)
             layer.position = (int(self._center_x - layer.width / 2),
                               int(self._center_y - layer.height / 2))
 
@@ -97,10 +97,18 @@ class TransformTool(Tool):
             sy = max(0.05, self._base_scale_y + dy / max(src_h, 1))
             layer.transform_scale_x = sx
             layer.transform_scale_y = sy
-            layer.compute_display()
+            layer.compute_display(fast=True)
             layer.position = (int(self._center_x - layer.width / 2),
                               int(self._center_y - layer.height / 2))
 
     def on_release(self, doc: Document, x: int, y: int) -> None:
         if self._dragging:
             self._dragging = False
+            # The drag used nearest-neighbour sampling to stay interactive
+            # (293 ms/event at 4K with the quality path). Re-derive the
+            # layer at full quality now that the gesture has ended.
+            layer = doc.layers.active_layer
+            if layer is not None and layer._source_pixels is not None:
+                layer.compute_display(fast=False)
+                layer.position = (int(self._center_x - layer.width / 2),
+                                  int(self._center_y - layer.height / 2))

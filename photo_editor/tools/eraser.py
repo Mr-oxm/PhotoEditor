@@ -180,6 +180,7 @@ class EraserTool(Tool):
         doc.save_snapshot("Eraser Stroke")
         self._drawing = True
         self._last_x, self._last_y = x, y
+        self._begin_stroke_mask(doc)
         self._erase_along(doc, x, y, x, y, pressure)
 
     def on_move(self, doc: Document, x: int, y: int, pressure: float = 1.0) -> None:
@@ -190,3 +191,4 @@ class EraserTool(Tool):
 
     def on_release(self, doc: Document, x: int, y: int) -> None:
         self._drawing = False
+        self._end_stroke_mask()
