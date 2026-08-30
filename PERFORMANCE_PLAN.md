@@ -259,11 +259,12 @@ Measured on the reference machine, 20 layers, 3840×2160, viewport 1600×1000.
 
 | # | Goal | Baseline | Target | Achieved | Met |
 |---|---|---:|---:|---:|---|
-| G1 | Interactive drag frame, 20×4K | 3,981 ms | ≤ 16.7 ms | **13.0 ms (77 fps)** | yes |
-| G2 | Full recomposite (preview path) | 3,981 ms | ≤ 33 ms | **35 ms** | ~ |
+| G1 | Interactive drag frame, 20×4K | 3,981 ms | ≤ 16.7 ms | **11.7–17.5 ms** | yes |
+| G2 | Full recomposite, warm layer cache | 3,981 ms | ≤ 33 ms | **32 ms** | yes |
+| G2b | Full recomposite, cold (structural change) | 3,981 ms | ≤ 33 ms | **105 ms** | **no** |
 | G3 | Layer pixel memory, 20×4K | 2,531 MB | ≤ 1,000 MB | 2,531 MB | **no** |
 | G4 | Undo snapshot time | 667 ms | ≤ 20 ms | **2.9 ms** | yes |
-| G5 | Undo history memory | 123.6 GB | ≤ 2,000 MB | **1,139 MB, bounded** | yes |
+| G5 | Undo history memory | 123.6 GB | ≤ 2,000 MB | **2,152 MB, bounded** | ~ |
 | G6 | Single 4K NORMAL blend | 233 ms | ≤ 30 ms | **17 ms** | yes |
 | G7 | Brush stroke latency, 4K layer | 1.12 ms/event | ≤ 10 ms | **0.05 ms** | yes |
 | G8 | Cold start | ~1,930 ms | ≤ 1,500 ms | **~925 ms of real work** | ~ |
@@ -272,10 +273,27 @@ Measured on the reference machine, 20 layers, 3840×2160, viewport 1600×1000.
 
 **Where the targets were not met, and why**
 
-*G2 (33 ms).* A full rebuild after a structural change is 35 ms at twenty
-layers — 29 fps against a 30 fps target, close enough to be indistinguishable
-in use, and it only happens when the stack itself changes rather than
-during a drag.
+*G1.* Met, but the honest figure is a range, not a single number. A drag
+costs 11.7 ms with the focus at the top of a twenty-layer stack, 15.2 ms in
+the middle and 17.5 ms at the bottom, and it is flat in layer count at each.
+The first version of this document reported only the top-of-stack figure,
+which was the sandwich cache's best case; the benchmark now reports all
+three so that cannot happen again.
+
+*G1 caveat — the mouse-down hitch.* Entering a drag composites both halves
+of the sandwich once: **241 ms** for twenty 4K layers, 355 ms for thirty. No
+per-frame number includes it. It is the largest remaining piece of work.
+
+*G2b (cold rebuild).* 32 ms is with the layer raster cache warm, which is
+the common case — moving, hiding, or restyling a layer. A genuine
+structural change that invalidates the whole layer cache costs **105 ms**.
+The original entry quoted only the warm figure without saying so.
+
+*G5 (2 GB).* 2,152 MB against a 2,000 MB target — a 7% overshoot, because
+eviction only runs when a state is pushed, so the budget is exceeded by up
+to one state's worth between pushes. Retention is bounded and independent
+of layer count, which was the point; the absolute cap is now 2 GB rather
+than the 4 GB an 8%-of-RAM share gave on this machine.
 
 *G3 (1 GB of layer pixels).* Not met, and deliberately not pursued. Layer
 pixels are float32 because that is what every tool, filter and adjustment
@@ -500,13 +518,15 @@ and a matching group brings its subtree.
 
 Ordered by value.
 
-1. **Over-cache half of the sandwich** — the *under* half is implemented and
-   is what makes drag frames flat in layer count. The *over* half (layers
-   above the focus, pre-composited when they form an isolated NORMAL run)
-   is designed and its validity check is written and tested
-   (`over_run_is_isolatable`) but not yet wired. It would help when
-   dragging a layer near the bottom of a deep stack.
-2. **Confirm startup on a real display** — the splash no longer blocks, but
+1. **The mouse-down hitch** — entering a drag composites both halves of the
+   sandwich, 241 ms at twenty 4K layers. Candidates: prime on the parallel
+   compositor rather than the single-threaded interactive one; prime the
+   under half only and let the over half fill in on the second frame; or
+   prime incrementally from the previous focus's caches.
+2. **Cold rebuild (G2b)** — 105 ms when a structural change invalidates the
+   layer cache. The layer preparation is re-done for every layer; only the
+   changed one needs it.
+3. **Confirm startup on a real display** — the splash no longer blocks, but
    the end-to-end figure could not be measured under the offscreen platform
    (see G8 above).
 3. **Gradient tool** — the handle-drag path renders the gradient at full

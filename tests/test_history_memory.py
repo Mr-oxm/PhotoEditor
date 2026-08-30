@@ -311,3 +311,50 @@ def test_selection_snapshots_are_keyed_on_version_not_address():
     assert not np.array_equal(second, first)
     # The stored mask must be the one that was actually selected.
     assert second[25, 35] > 0.5 and second[5, 5] < 0.5
+
+
+def test_vector_metadata_is_shared_between_snapshots():
+    """Vector and text layers serialise their whole scene graph into every
+    snapshot. Those are deep Python structures the byte budget cannot see,
+    so unshared they grow with no bound it can reclaim -- measured at
+    ~0.66 MB per snapshot for a small scene."""
+    from photo_editor.core.enums import LayerType
+    from photo_editor.core.layer import Layer
+    from photo_editor.vector.scene import VectorLayer
+
+    doc = _doc(2)
+    vec = Layer(name="V", width=32, height=32, layer_type=LayerType.SHAPE)
+    vec._vector_data = VectorLayer()
+    doc.layers.add(vec)
+
+    doc.save_snapshot("s0")
+    first = doc.history.states[-1].metadata.get(f"_vector_data:{vec.id}")
+    assert first is not None, "vector metadata was not recorded"
+
+    # Edit a *different* layer; the vector layer is untouched.
+    _edit(doc.layers.layers[1], 0.4)
+    doc.save_snapshot("s1")
+    second = doc.history.states[-1].metadata.get(f"_vector_data:{vec.id}")
+
+    assert second is first, (
+        "an unchanged vector layer re-serialised its scene graph into the "
+        "new snapshot instead of sharing it")
+
+
+def test_changed_vector_metadata_is_re_serialised():
+    """Sharing must not go stale."""
+    from photo_editor.core.enums import LayerType
+    from photo_editor.core.layer import Layer
+    from photo_editor.vector.scene import VectorLayer
+
+    doc = _doc(2)
+    vec = Layer(name="V", width=32, height=32, layer_type=LayerType.SHAPE)
+    vec._vector_data = VectorLayer()
+    doc.layers.add(vec)
+    doc.save_snapshot("s0")
+    first = doc.history.states[-1].metadata.get(f"_vector_data:{vec.id}")
+
+    vec.touch()
+    doc.save_snapshot("s1")
+    second = doc.history.states[-1].metadata.get(f"_vector_data:{vec.id}")
+    assert second is not first, "a changed vector layer reused stale metadata"

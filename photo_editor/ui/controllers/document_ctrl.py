@@ -300,7 +300,11 @@ class DocumentController(ControllerBase):
                 f"Saved {Path(path).name} — later edits are still unsaved",
                 3000)
         self.ctx.set_window_title(f"Basera — {Path(path).name}")
-        idx = self._session.current_index()
+        # The tab holding THIS document, not whichever is current when the
+        # background save finishes. The user may well have switched tabs
+        # during a multi-second save, and renaming the active tab instead
+        # rewrites the wrong document's path.
+        idx = self._tab_index_for(doc)
         if idx >= 0:
             self._session.update_path(idx, path)
             self._session.update_tab_metadata(
@@ -314,6 +318,17 @@ class DocumentController(ControllerBase):
             pass
         if unchanged:
             self.ctx.show_status_message(f"Saved {Path(path).name}", 2000)
+
+    def _tab_index_for(self, doc) -> int:
+        """Index of the tab holding *doc*, or -1."""
+        session = self._session
+        if session is None:
+            return -1
+        for i in range(len(session)):
+            entry = session.entry_at(i)
+            if entry is not None and entry.document is doc:
+                return i
+        return -1
 
     def _forget_autosave(self, doc) -> None:
         """Drop *doc*'s autosave now that it is on disk."""

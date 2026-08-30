@@ -26,7 +26,10 @@ _HISTORY_SHARE = 0.08
 _RENDER_CACHE_MIN = 192 * MB
 _RENDER_CACHE_MAX = 2 * GB
 _HISTORY_MIN = 128 * MB
-_HISTORY_MAX = 4 * GB
+# Capped at the 2 GB the performance plan targets. 8% of a 48 GB
+# workstation is nearly 4 GB of undo history, which is more than the
+# feature is worth and more than the plan promised.
+_HISTORY_MAX = 2 * GB
 
 _DEFAULT_TOTAL = 8 * GB   # assumed when the platform will not say
 

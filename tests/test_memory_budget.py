@@ -135,3 +135,24 @@ def test_history_budget_is_not_overshot_by_the_state_floor():
     assert len(mgr.states) == 1, (
         f"history kept {len(mgr.states)} oversized states against its budget")
     assert mgr.can_undo is False or len(mgr.states) >= 1
+
+
+def test_closing_the_last_document_releases_the_render_cache(qtbot):
+    """With nothing open the caches can serve nothing, but were holding the
+    whole render-cache budget while the welcome screen was up."""
+    from photo_editor.ui.main_window import MainWindow
+
+    win = MainWindow(dev_mode=True)
+    qtbot.addWidget(win)
+    try:
+        win._autosave_timer.stop()
+        win._pipeline.execute_to_uint8(win._doc)
+        assert win._pipeline.cache_stats()["entries"] > 0
+
+        win._on_last_tab_closed()
+        assert win._pipeline.cache_stats()["entries"] == 0, (
+            "render cache retained after the last document closed")
+        assert win._pipeline.sandwich.nbytes() == 0
+    finally:
+        if win._doc is not None:
+            win._doc.mark_clean()

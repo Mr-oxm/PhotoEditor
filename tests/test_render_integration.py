@@ -197,20 +197,66 @@ def test_edit_during_an_in_flight_render_is_not_lost(win, qtbot):
 
 
 def test_pipeline_epoch_blocks_stale_cache_publication():
-    """Unit-level version of the above, without the UI."""
+    """A render that began before an edit must not publish its result.
+
+    This drives the actual race: the pipeline is invalidated *during* the
+    composite, and the finishing render must decline to mark its now-stale
+    output as the valid cache. Written so that deleting the epoch guard
+    makes it fail -- the previous version of this test passed either way,
+    which is how the guard went unverified.
+    """
     from photo_editor.core.document import Document
     from photo_editor.engine.render_pipeline import RenderPipeline
 
     doc = Document(64, 48)
     pipe = RenderPipeline()
-    pipe.execute_to_uint8(doc)
-    assert pipe._uint8_valid
 
-    # Simulate a render that started before an invalidation lands.
-    epoch_before = pipe._epoch
-    pipe.invalidate()
-    assert pipe._epoch != epoch_before
-    assert not pipe._uint8_valid
+    # Invalidate from inside the composite, exactly as an edit arriving on
+    # the UI thread while a render worker is running would.
+    original = pipe._compositor.composite
+    fired = []
+
+    def compositing(*args, **kwargs):
+        if not fired:
+            fired.append(1)
+            pipe.invalidate()          # the edit lands mid-render
+        return original(*args, **kwargs)
+
+    pipe._compositor.composite = compositing
+    try:
+        pipe.execute_planar(doc)
+    finally:
+        pipe._compositor.composite = original
+
+    assert fired, "the invalidation never ran; the test proves nothing"
+    assert not pipe._planar_valid, (
+        "a render that started before an invalidation published its result "
+        "as the valid cache; the next render would return stale pixels")
+    assert pipe._result_planar is None
+
+
+def test_epoch_guard_also_protects_the_uint8_cache():
+    from photo_editor.core.document import Document
+    from photo_editor.engine.render_pipeline import RenderPipeline
+
+    doc = Document(64, 48)
+    pipe = RenderPipeline()
+    original = pipe._compositor.composite
+    fired = []
+
+    def compositing(*args, **kwargs):
+        if not fired:
+            fired.append(1)
+            pipe.invalidate()
+        return original(*args, **kwargs)
+
+    pipe._compositor.composite = compositing
+    try:
+        pipe.execute_to_uint8(doc)
+    finally:
+        pipe._compositor.composite = original
+
+    assert not pipe._uint8_valid, "stale uint8 result was published as valid"
 
 
 def test_scheduler_is_genuinely_double_buffered(win, qtbot):

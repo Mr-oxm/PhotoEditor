@@ -882,6 +882,14 @@ class MainWindow(QMainWindow):
     def _on_last_tab_closed(self) -> None:
         """Called when the last tab is closed — return to welcome screen."""
         self._doc = None
+        # With no document open there is nothing the caches can serve, and
+        # they can be holding the whole render-cache budget while the user
+        # stares at the welcome screen.
+        try:
+            self._pipeline.end_interaction()
+            self._pipeline.invalidate()
+        except Exception:
+            pass
         if not self._dev_mode:
             self._show_welcome_screen()
 

@@ -11,6 +11,21 @@ from .layer_stack import LayerStack
 from .selection import Selection
 
 
+def _shared_meta(prev, lid: str, key: str, version: int, build):
+    """Reuse the previous snapshot's serialised metadata when unchanged.
+
+    Vector and text layers serialise their whole scene graph into every
+    snapshot. Those are deep Python structures, one per snapshot per layer,
+    and the history byte budget only counts numpy arrays -- so unshared they
+    grow with no bound the budget can see or reclaim.
+    """
+    if prev is not None and prev.layer_versions.get(f"{key}:{lid}") == version:
+        cached = prev.metadata.get(f"{key}:{lid}")
+        if cached is not None:
+            return cached
+    return build()
+
+
 class Document:
     """Top-level container for an editing session."""
 
@@ -509,6 +524,8 @@ class Document:
         # Save the full layer structure so add/remove can be undone
         layer_metas = []
         for layer in self.layers:
+            lid = layer.id
+            version = layer.content_version
             meta = {
                 "id": layer.id,
                 "name": layer.name,
@@ -532,18 +549,31 @@ class Document:
                 "transform_base_w": layer.transform_base_w,
                 "transform_base_h": layer.transform_base_h,
             }
-            # Save text layer data if present
+            # Save text layer data if present. Shared with the previous
+            # snapshot when the layer has not changed: these are deep dict
+            # trees, one per snapshot per layer, and the history byte budget
+            # only counts numpy arrays -- so unshared they grow without any
+            # bound the budget can see.
             td = getattr(layer, "_text_data", None)
             if td is not None:
-                meta["_text_data"] = td.to_dict()
+                meta["_text_data"] = _shared_meta(
+                    prev, lid, "_text_data", version, td.to_dict)
+                state.metadata[f"_text_data:{lid}"] = meta["_text_data"]
+                state.layer_versions[f"_text_data:{lid}"] = version
             # Save adjustment / filter layer data if present
             if layer.adjustment is not None:
                 meta["_adjustment_name"] = layer.adjustment.name
                 meta["_adjustment_params"] = dict(layer.adjustment_params)
-            # Save vector layer data if present
+            # Save vector layer data if present -- shared as above. An
+            # imported SVG re-serialised on every snapshot was measured at
+            # ~0.66 MB per snapshot for a small scene, invisible to the
+            # budget and bounded only by the 200-state cap.
             vd = getattr(layer, "_vector_data", None)
             if vd is not None and hasattr(vd, "to_dict"):
-                meta["_vector_data"] = vd.to_dict()
+                meta["_vector_data"] = _shared_meta(
+                    prev, lid, "_vector_data", version, vd.to_dict)
+                state.metadata[f"_vector_data:{lid}"] = meta["_vector_data"]
+                state.layer_versions[f"_vector_data:{lid}"] = version
             layer_metas.append(meta)
         state.metadata["_layer_order"] = [l.id for l in self.layers]
         state.metadata["_layer_meta"] = {m["id"]: m for m in layer_metas}
