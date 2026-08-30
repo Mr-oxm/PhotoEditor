@@ -18,6 +18,7 @@ cached by :class:`~photo_editor.engine.layer_cache.LayerRasterCache`.
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -33,6 +34,12 @@ from ..styles.style_engine import StyleEngine
 
 if TYPE_CHECKING:
     from .layer_cache import LayerRasterCache
+
+
+def _round_half_up(value: float) -> int:
+    """Round .5 away from zero -- translation-invariant, unlike round()."""
+    return int(math.floor(value + 0.5)) if value >= 0 else -int(
+        math.floor(-value + 0.5))
 
 
 class PlanarCompositor:
@@ -51,12 +58,25 @@ class PlanarCompositor:
         # level 0 is full resolution and is what export uses.
         self._level = 0
         self._scale = 1.0
+        # The whole frame's region in level coordinates, shared by every
+        # band. Layer preparation is cropped to it, so a zoomed-in view of a
+        # large document only converts the pixels it is going to show.
+        self._frame_roi: tuple[int, int, int, int] | None = None
 
     def _pos(self, position: tuple[int, int]) -> tuple[int, int]:
-        """Translate a document-space position into scaled band space."""
+        """Translate a document-space position into scaled band space.
+
+        Uses round-half-up rather than Python's ``round``. Banker's
+        rounding is not translation-invariant -- round(2.5) is 2 but
+        round(3.5) is 4 -- so a layer at an odd position landed on a
+        different output pixel depending on where the viewport crop began,
+        which showed up as content shifting by a pixel while panning.
+        Round-half-up satisfies f(a + n) == f(a) + n for integer n, so a
+        layer lands in the same place whatever the crop.
+        """
         if self._scale != 1.0:
-            position = (int(round(position[0] * self._scale)),
-                        int(round(position[1] * self._scale)))
+            position = (_round_half_up(position[0] * self._scale),
+                        _round_half_up(position[1] * self._scale))
         if self._ox == 0 and self._oy == 0:
             return position
         return (position[0] - self._ox, position[1] - self._oy)
@@ -140,25 +160,90 @@ class PlanarCompositor:
         return res
 
     def _get_effective_mask(self, layer: Layer, stack: LayerStack) -> np.ndarray | None:
-        return self._scaled_mask(MaskManager.get_combined_mask(layer, stack))
+        """Full-resolution combined mask, or None.
+
+        Deliberately *not* scaled here: a mask has to be cropped by the same
+        offset as its layer's pixels before being downscaled, or it slides
+        out of registration whenever a viewport ROI crops the layer.
+        """
+        return MaskManager.get_combined_mask(layer, stack)
+
+    def _prepare_mask(self, layer: Layer, stack: LayerStack,
+                      crop: tuple[int, int],
+                      shape: tuple[int, int]) -> np.ndarray | None:
+        """Mask for *layer*, cropped and scaled to match its prepared pixels."""
+        mask = MaskManager.get_combined_mask(layer, stack)
+        if mask is None:
+            return None
+        cx, cy = crop
+        if cx or cy:
+            mask = mask[cy:, cx:]
+        mask = self._downscale(mask)
+        # Clamp to the prepared pixel block so blend_planar_region's overlap
+        # maths cannot be truncated by a mask that is a pixel short.
+        h, w = shape
+        if mask.shape[0] < h or mask.shape[1] < w:
+            padded = np.zeros((h, w), dtype=np.float32)
+            mh = min(h, mask.shape[0])
+            mw = min(w, mask.shape[1])
+            padded[:mh, :mw] = mask[:mh, :mw]
+            mask = padded
+        return mask
 
     # ------------------------------------------------------------------
     # Per-layer pixel preparation
     # ------------------------------------------------------------------
 
+    def _crop_to_frame(self, pixels: np.ndarray, blend_pos: tuple[int, int],
+                       ):
+        """Crop full-resolution *pixels* to the part inside the frame ROI.
+
+        *blend_pos* is in full-resolution document coordinates; the frame
+        ROI is in level coordinates, so it is scaled up to match. Returns
+        None when the layer lies entirely outside the frame.
+        """
+        roi = self._frame_roi
+        if roi is None:
+            return pixels, blend_pos, (0, 0)
+        f = 1 << self._level
+        rx, ry, rw, rh = roi[0] * f, roi[1] * f, roi[2] * f, roi[3] * f
+        px, py = blend_pos
+        lh, lw = pixels.shape[:2]
+        x0 = max(0, rx - px)
+        y0 = max(0, ry - py)
+        x1 = min(lw, rx + rw - px)
+        y1 = min(lh, ry + rh - py)
+        if x1 <= x0 or y1 <= y0:
+            return None
+        if x0 == 0 and y0 == 0 and x1 == lw and y1 == lh:
+            return pixels, blend_pos, (0, 0)
+        # Snap both edges to the level grid. INTER_AREA averages each
+        # destination pixel over a box of source pixels, so a crop that does
+        # not start and end on a box boundary shifts the whole downscale by
+        # a fraction of a pixel -- visible as content jittering while
+        # panning, and as a seam where two ROIs meet.
+        x0 -= x0 % f
+        y0 -= y0 % f
+        if x1 % f:
+            x1 = min(lw, x1 + (f - x1 % f))
+        if y1 % f:
+            y1 = min(lh, y1 + (f - y1 % f))
+        return pixels[y0:y1, x0:x1], (px + x0, py + y0), (x0, y0)
+
     def _prepare_layer(
         self, layer: Layer, adj_children: dict[str, list[Layer]],
-    ) -> tuple[np.ndarray, tuple[int, int]]:
+    ) -> tuple[np.ndarray, tuple[int, int]] | None:
         """Return (planar pixels, blend position) for a raster-like layer.
 
         Applies styles, channel toggles and scoped adjustment/filter
         children, then converts to planar. Cached when a cache is attached.
         """
         kids = adj_children.get(layer.id)
+        slot = (self._level, self._frame_roi)
         if self._cache is not None:
-            cached = self._cache.get_prepared(layer, kids, self._level)
+            cached = self._cache.get_prepared(layer, kids, slot)
             if cached is not None:
-                return cached
+                return cached if cached[0] is not None else None
 
         # Styles and filters are applied at full resolution and only then
         # downscaled. Scaling their *parameters* instead would be cheaper
@@ -175,10 +260,20 @@ class PlanarCompositor:
             if pad > 0:
                 blend_pos = (layer.position[0] - pad, layer.position[1] - pad)
 
+        cropped = self._crop_to_frame(pixels, blend_pos)
+        if cropped is None:
+            # Entirely outside the frame -- cache the miss so the whole
+            # preparation is skipped on subsequent bands and frames.
+            if self._cache is not None:
+                self._cache.put_prepared(
+                    layer, kids, (None, blend_pos, (0, 0)), slot, nbytes=0)
+            return None
+        pixels, blend_pos, crop = cropped
+
         planar = to_planar(self._downscale(pixels))
-        result = (planar, blend_pos)
+        result = (planar, blend_pos, crop)
         if self._cache is not None:
-            self._cache.put_prepared(layer, kids, result, self._level)
+            self._cache.put_prepared(layer, kids, result, slot)
         return result
 
     # ------------------------------------------------------------------
@@ -214,12 +309,18 @@ class PlanarCompositor:
         return canvas
 
     def _place_mask_combined(self, layer: Layer, stack: LayerStack,
-                             cw: int, ch: int) -> np.ndarray | None:
+                             cw: int, ch: int,
+                             crop: tuple[int, int] = (0, 0)) -> np.ndarray | None:
         combined = self._get_effective_mask(layer, stack)
         if combined is None:
             return None
+        cx, cy = crop
+        if cx or cy:
+            combined = combined[cy:, cx:]
+        combined = self._downscale(combined)
+        px, py = layer.position
         return self._place_mask_array(
-            combined, self._pos(layer.position), cw, ch)
+            combined, self._pos((px + cx, py + cy)), cw, ch)
 
     # ------------------------------------------------------------------
     # Adjustment application on a canvas-sized planar buffer
@@ -240,7 +341,8 @@ class PlanarCompositor:
     def composite(self, stack: LayerStack, width: int, height: int,
                   origin: tuple[int, int] = (0, 0),
                   out: np.ndarray | None = None,
-                  level: int = 0) -> np.ndarray:
+                  level: int = 0,
+                  frame_roi: tuple[int, int, int, int] | None = None) -> np.ndarray:
         """Composite *stack* into a planar (4, height, width) float32 buffer.
 
         *width* and *height* are the canvas size in *output* pixels. When
@@ -254,6 +356,7 @@ class PlanarCompositor:
         self._ox, self._oy = origin
         self._level = level
         self._scale = 1.0 / (1 << level)
+        self._frame_roi = frame_roi
         # Root-level adjustment layers rebind `canvas` to the adjusted
         # result, so the buffer we finish with may not be the one we were
         # handed. Remember the caller's buffer and copy back at the end.
@@ -364,7 +467,8 @@ class PlanarCompositor:
                     if not layer.channel_g: group_img[1] = 0.0
                     if not layer.channel_b: group_img[2] = 0.0
                     if not layer.channel_a: group_img[3] = 0.0
-                group_mask = self._get_effective_mask(layer, stack)
+                group_mask = self._scaled_mask(
+                    self._get_effective_mask(layer, stack))
                 if group_mask is not None:
                     placed_mask = self._place_mask_array(
                         group_mask, self._pos(layer.position), width, height)
@@ -375,8 +479,14 @@ class PlanarCompositor:
                 prev_img = group_img
                 continue
 
-            mask = self._get_effective_mask(layer, stack)
-            pixels, blend_pos = self._prepare_layer(layer, adj_children)
+            prepared = self._prepare_layer(layer, adj_children)
+            if prepared is None:
+                release_prev(prev_img)
+                prev_img = None
+                continue
+            pixels, blend_pos, crop = prepared
+            mask = self._prepare_mask(
+                layer, stack, crop, pixels.shape[1:])
 
             _has_clip_child = any(
                 rc.clips_parent for rc in regular_children.get(layer.id, ()))
@@ -387,7 +497,7 @@ class PlanarCompositor:
                 borrowed.append(placed)
                 placed[3] *= prev_img[3]
                 placed_mask = (
-                    self._place_mask_combined(layer, stack, width, height)
+                    self._place_mask_combined(layer, stack, width, height, crop)
                     if mask is not None else None
                 )
                 blend_planar_region(canvas, placed, (0, 0),
@@ -402,13 +512,16 @@ class PlanarCompositor:
                 for child in regular_children[layer.id]:
                     if not child.clips_parent:
                         continue
-                    c_pix, c_pos = self._prepare_layer(child, adj_children)
+                    child_prep = self._prepare_layer(child, adj_children)
+                    if child_prep is None:
+                        continue
+                    c_pix, c_pos, _ = child_prep
                     c_placed = self._place_planar(
                         c_pix, self._pos(c_pos), width, height)
                     parent_placed[3] *= c_placed[3]
                     self._scratch.release(c_placed)
                 placed_mask = (
-                    self._place_mask_combined(layer, stack, width, height)
+                    self._place_mask_combined(layer, stack, width, height, crop)
                     if mask is not None else None
                 )
                 blend_planar_region(canvas, parent_placed, (0, 0),
@@ -457,12 +570,15 @@ class PlanarCompositor:
         adj_children: dict, parent_placed: np.ndarray, width: int, height: int,
     ) -> None:
         """Composite *child* clipped to *parent_placed*'s alpha."""
+        prepared = self._prepare_layer(child, adj_children)
+        if prepared is None:
+            return          # entirely outside the frame ROI
+        c_pix, c_pos, c_crop = prepared
         c_mask = self._get_effective_mask(child, stack)
-        c_pix, c_pos = self._prepare_layer(child, adj_children)
-        c_placed = self._place_planar(c_pix, c_pos, width, height)
+        c_placed = self._place_planar(c_pix, self._pos(c_pos), width, height)
         c_placed[3] *= parent_placed[3]
         c_placed_mask = (
-            self._place_mask_combined(child, stack, width, height)
+            self._place_mask_combined(child, stack, width, height, c_crop)
             if c_mask is not None else None
         )
         blend_planar_region(canvas, c_placed, (0, 0),
@@ -518,8 +634,11 @@ class PlanarCompositor:
             if layer.layer_type in (LayerType.ADJUSTMENT, LayerType.FILTER):
                 continue
 
-            mask = self._get_effective_mask(layer, stack)
-            pixels, blend_pos = self._prepare_layer(layer, adj_children)
+            prepared = self._prepare_layer(layer, adj_children)
+            if prepared is None:
+                continue
+            pixels, blend_pos, crop = prepared
+            mask = self._prepare_mask(layer, stack, crop, pixels.shape[1:])
 
             _has_clip_child = any(
                 rc.clips_parent for rc in regular_children.get(layer.id, ()))
@@ -530,13 +649,16 @@ class PlanarCompositor:
                 for child in regular_children[layer.id]:
                     if not child.clips_parent:
                         continue
-                    c_pix, c_pos = self._prepare_layer(child, adj_children)
+                    child_prep = self._prepare_layer(child, adj_children)
+                    if child_prep is None:
+                        continue
+                    c_pix, c_pos, _ = child_prep
                     c_placed = self._place_planar(
                         c_pix, self._pos(c_pos), w, h)
                     parent_placed[3] *= c_placed[3]
                     self._scratch.release(c_placed)
                 placed_mask = (
-                    self._place_mask_combined(layer, stack, w, h)
+                    self._place_mask_combined(layer, stack, w, h, crop)
                     if mask is not None else None
                 )
                 blend_planar_region(canvas, parent_placed, (0, 0),

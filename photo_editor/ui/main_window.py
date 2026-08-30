@@ -62,8 +62,8 @@ class MainWindow(QMainWindow):
         self._pipeline = RenderPipeline()
         self._render_scheduler = RenderScheduler(
             self._pipeline,
-            interval_ms=33,
-            preview_max_size=0,  # Full res for now; set to 2048 when coord scaling is ready
+            interval_ms=16,          # ~60 fps ceiling
+            preview_max_size=2048,   # replaced per-frame by _sync_preview_level
         )
         self._tools = ToolManager()
 
@@ -398,10 +398,32 @@ class MainWindow(QMainWindow):
         self._status.zoom_to_mouse = self._canvas.zoom_to_mouse
         # Guide drag wired by ViewController
 
+    def _sync_preview_level(self) -> None:
+        """Match the render resolution to what the screen actually shows.
+
+        Compositing a 4K document at 4K while displaying it at 40% zoom does
+        six times the necessary work. Conversely, rendering a fixed-size
+        preview would go soft the moment the user zooms in. So the target is
+        simply the document's on-screen size: never fewer pixels than are
+        displayed, never many more.
+        """
+        if not self._doc:
+            return
+        longest = max(self._doc.width, self._doc.height)
+        target = int(longest * self._canvas.zoom)
+        # Clamp up to a floor so a very zoomed-out view still has enough
+        # detail for the layer panel and for zooming back in smoothly.
+        target = max(512, min(target, longest))
+        self._render_scheduler.set_preview_max_size(target)
+        # Only composite what is on screen. At 100% zoom a 4K document
+        # shows a fraction of its pixels; rendering the rest is waste.
+        self._render_scheduler.set_roi(self._canvas.visible_doc_rect())
+
     def _on_canvas_view_changed(self) -> None:
         self._view_ctrl.update_rulers()
         self._status.set_zoom(self._canvas.zoom)
         self._sync_canvas_scrollbars()
+        self._sync_preview_level()
 
     def _sync_canvas_scrollbars(self) -> None:
         span_x, span_y = self._canvas.scrollable_span()
@@ -469,12 +491,15 @@ class MainWindow(QMainWindow):
             # async render runs.  The render callback will then refresh
             # again with thumbnails once the composite is ready.
             self._layers_panel.refresh(self._doc, thumbnails=False)
+            self._sync_preview_level()
             self._pipeline.invalidate(layer_id)
             self._render_scheduler.enqueue_render(self._doc, full_refresh=True)
         else:
             # Cache hit — sync path is fast
             result = self._pipeline.execute_to_uint8(self._doc)
-            self._canvas.set_image(result, force=False)
+            self._canvas.set_image(
+                result, force=False,
+                doc_size=(self._doc.width, self._doc.height), src_rect=None)
             self._layers_panel.refresh(self._doc)
             self._history_panel.refresh(self._doc.history)
             self._transform_panel.refresh(self._doc)
@@ -487,6 +512,7 @@ class MainWindow(QMainWindow):
         """Re-render and update canvas only (skip panel updates). Async."""
         if not self._doc:
             return
+        self._sync_preview_level()
         active = self._doc.layers.active_layer
         self._pipeline.invalidate(active.id if active else None)
         self._render_scheduler.enqueue_render(self._doc, full_refresh=False)
@@ -500,18 +526,29 @@ class MainWindow(QMainWindow):
         self._render_scheduler.enqueue_render(self._doc, full_refresh=False)
 
     def _schedule_render(self) -> None:
-        """Request a deferred render (throttled ~30fps, off UI thread)."""
+        """Request a deferred render (throttled, off the UI thread)."""
         if not self._doc:
             return
+        self._sync_preview_level()
         active = self._doc.layers.active_layer
         self._pipeline.invalidate(active.id if active else None)
         self._render_scheduler.enqueue_render(self._doc, full_refresh=False)
 
-    def _on_render_ready(self, rgba, _gen_id: int, full_refresh: bool) -> None:
+    def _on_render_ready(self, rgba, _gen_id: int, full_refresh: bool,
+                         doc_w: int = 0, doc_h: int = 0,
+                         src_rect=None) -> None:
         """Render worker completed — update canvas and optionally panels."""
         if not self._doc:
             return
-        self._canvas.set_image(rgba, force=True)
+        # The frame may be a downscaled preview covering only the visible
+        # region; the canvas still needs the document's logical size for all
+        # coordinate mapping, plus the rect the buffer actually covers.
+        self._canvas.set_image(
+            rgba, force=True,
+            doc_size=(doc_w, doc_h) if doc_w and doc_h
+            else (self._doc.width, self._doc.height),
+            src_rect=src_rect,
+        )
         self._sync_canvas_scrollbars()
         self._selection_ctrl.update_selection_overlay()
         self._transform_ctrl.update_transform_box()
@@ -526,7 +563,9 @@ class MainWindow(QMainWindow):
         """Render worker failed — fallback to sync render."""
         if self._doc:
             result = self._pipeline.execute_to_uint8(self._doc)
-            self._canvas.set_image(result, force=True)
+            self._canvas.set_image(
+                result, force=True,
+                doc_size=(self._doc.width, self._doc.height), src_rect=None)
             self._sync_canvas_scrollbars()
         self._status.show_activity(f"Render error: {message}", 3000)
 

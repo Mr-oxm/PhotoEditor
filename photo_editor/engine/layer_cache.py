@@ -55,6 +55,12 @@ def _params_fingerprint(adj_layers) -> tuple:
     return tuple(out)
 
 
+def _entry_bytes(entry) -> int:
+    """Bytes held by a cache entry; a 'layer is off-frame' marker holds none."""
+    planar = entry[1][0]
+    return planar.nbytes if planar is not None else 0
+
+
 def _hashable(value):
     if isinstance(value, (list, tuple)):
         return tuple(_hashable(v) for v in value)
@@ -98,18 +104,24 @@ class LayerRasterCache:
         return 1.0 / (1 << level)
 
     @staticmethod
-    def choose_level(width: int, height: int, max_size: int,
+    def choose_level(width: int, height: int, target_size: int,
                      max_level: int = 5) -> int:
-        """Smallest mip level whose longest side fits within *max_size*.
+        """Coarsest mip level that is still at least *target_size* across.
 
-        Returns 0 (full resolution) when *max_size* is 0 or already large
-        enough, so the export path is unaffected.
+        *target_size* is the size the composite will actually be *displayed*
+        at -- the document's longest side times the current zoom. Choosing
+        the coarsest level that still meets it means we never render fewer
+        pixels than the screen shows, so previews stay sharp, while never
+        rendering many more than it shows, which is the whole saving.
+
+        Returns 0 (full resolution) when *target_size* is 0, so the export
+        path is unaffected.
         """
-        if max_size <= 0:
+        if target_size <= 0:
             return 0
         longest = max(width, height)
         level = 0
-        while level < max_level and (longest >> level) > max_size:
+        while level < max_level and (longest >> (level + 1)) >= target_size:
             level += 1
         return level
 
@@ -136,8 +148,13 @@ class LayerRasterCache:
 
     # ---- Access ------------------------------------------------------------
 
-    def get_prepared(self, layer, adj_layers, level: int = 0):
-        """Return the cached (planar, blend_pos) at *level*, or None."""
+    def get_prepared(self, layer, adj_layers, level=0):
+        """Return the cached (planar, blend_pos) for *level*, or None.
+
+        *level* may be any hashable slot discriminator; the compositor
+        passes ``(mip level, frame ROI)`` so a zoomed-in view caches its
+        cropped preparation separately from a fit-zoom one.
+        """
         key = self._content_key(layer, adj_layers)
         if key is None:
             return None
@@ -151,19 +168,20 @@ class LayerRasterCache:
             self._hits += 1
             return entry[1]
 
-    def put_prepared(self, layer, adj_layers, value, level: int = 0) -> None:
+    def put_prepared(self, layer, adj_layers, value, level=0,
+                     nbytes: int | None = None) -> None:
         key = self._content_key(layer, adj_layers)
         if key is None:
             return
         planar = value[0]
-        size = planar.nbytes
+        size = planar.nbytes if nbytes is None else nbytes
         if size > self._budget:
             return  # A single layer larger than the whole budget: don't cache.
         slot = (layer.id, level)
         with self._lock:
             old = self._entries.pop(slot, None)
             if old is not None:
-                self._bytes -= old[1][0].nbytes
+                self._bytes -= _entry_bytes(old)
             self._entries[slot] = (key, value)
             self._bytes += size
             self._evict()
@@ -171,7 +189,7 @@ class LayerRasterCache:
     def _evict(self) -> None:
         while self._bytes > self._budget and self._entries:
             _, entry = self._entries.popitem(last=False)
-            self._bytes -= entry[1][0].nbytes
+            self._bytes -= _entry_bytes(entry)
 
     # ---- Invalidation ------------------------------------------------------
 
@@ -180,7 +198,7 @@ class LayerRasterCache:
         with self._lock:
             for slot in [k for k in self._entries if k[0] == layer_id]:
                 entry = self._entries.pop(slot)
-                self._bytes -= entry[1][0].nbytes
+                self._bytes -= _entry_bytes(entry)
 
     def clear(self) -> None:
         with self._lock:

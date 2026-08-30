@@ -23,6 +23,7 @@ oversubscribe against OpenCV's own pool; taller bands leave cores idle.
 from __future__ import annotations
 
 import os
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -59,15 +60,25 @@ class ParallelCompositor:
         self._max_workers = max_workers or min(DEFAULT_MAX_WORKERS, cpu)
         self._band_height = band_height
         self._cache = cache
-        # One compositor per worker: each owns its scratch pool, so bands
-        # never contend for buffers. The layer cache is shared and is
-        # internally synchronised.
-        self._compositors = [
-            PlanarCompositor(cache=cache) for _ in range(self._max_workers)
-        ]
+        # One compositor per *thread*, not per band. A compositor carries
+        # mutable per-composite state (band origin, mip level, frame ROI,
+        # scratch pool), so two bands running concurrently must never share
+        # one. Indexing compositors by band number silently did exactly
+        # that whenever there were more bands than workers, and the race
+        # dropped layers from the output. Thread-local storage makes the
+        # invariant structural.
+        self._local = threading.local()
         self._pool: ThreadPoolExecutor | None = None
 
     # ------------------------------------------------------------------
+
+    def _thread_compositor(self) -> PlanarCompositor:
+        """The calling thread's own compositor, created on first use."""
+        comp = getattr(self._local, "compositor", None)
+        if comp is None:
+            comp = PlanarCompositor(cache=self._cache)
+            self._local.compositor = comp
+        return comp
 
     def _ensure_pool(self) -> ThreadPoolExecutor:
         if self._pool is None:
@@ -86,7 +97,9 @@ class ParallelCompositor:
 
     def composite(self, stack: LayerStack, width: int, height: int,
                   out: np.ndarray | None = None,
-                  level: int = 0) -> np.ndarray:
+                  level: int = 0,
+                  origin: tuple[int, int] = (0, 0),
+                  frame_roi: tuple[int, int, int, int] | None = None) -> np.ndarray:
         """Composite *stack* into a planar (4, height, width) buffer.
 
         *width* / *height* are output pixels; at *level* > 0 that is the
@@ -99,8 +112,9 @@ class ParallelCompositor:
                 or self._max_workers <= 1
                 or height <= self._band_height
                 or self._would_thrash(stack, width, height)):
-            self._compositors[0].composite(stack, width, height, out=out,
-                                           level=level)
+            self._thread_compositor().composite(
+                stack, width, height, out=out, level=level, origin=origin,
+                frame_roi=frame_roi)
             return out
 
         bands = [
@@ -110,13 +124,16 @@ class ParallelCompositor:
 
         # Warm the shared layer cache single-threaded first. Otherwise every
         # band races to prepare the same layers and each does the work.
-        self._prewarm(stack, level)
+        self._prewarm(stack, level, frame_roi)
+
+        ox, oy = origin
 
         def render_band(index_band):
-            index, (y0, y1) = index_band
-            comp = self._compositors[index % self._max_workers]
-            comp.composite(stack, width, y1 - y0, origin=(0, y0),
-                           out=out[:, y0:y1, :], level=level)
+            _, (y0, y1) = index_band
+            comp = self._thread_compositor()
+            comp.composite(stack, width, y1 - y0, origin=(ox, oy + y0),
+                           out=out[:, y0:y1, :], level=level,
+                           frame_roi=frame_roi)
 
         pool = self._ensure_pool()
         list(pool.map(render_band, enumerate(bands)))
@@ -142,13 +159,15 @@ class ParallelCompositor:
         n_visible = sum(1 for l in stack if l.visible)
         return (per_layer * n_visible) > (budget * WORKING_SET_LIMIT)
 
-    def _prewarm(self, stack: LayerStack, level: int = 0) -> None:
+    def _prewarm(self, stack: LayerStack, level: int = 0,
+                 frame_roi=None) -> None:
         """Populate the layer cache on one thread before fanning out."""
         if self._cache is None:
             return
         # A 1x1 composite walks the same preparation path as a full one but
         # writes almost nothing, so it fills the cache cheaply.
-        self._compositors[0].composite(stack, 1, 1, origin=(0, 0), level=level)
+        self._thread_compositor().composite(
+            stack, 1, 1, origin=(0, 0), level=level, frame_roi=frame_roi)
 
 
 class _SerialFallback:

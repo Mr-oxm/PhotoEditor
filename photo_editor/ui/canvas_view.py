@@ -93,6 +93,8 @@ class CanvasView(_BASE_CLASS):
         self._dab_is_eraser: bool = False
         # Cache identity of last rgba buffer to skip redundant QPixmap builds
         self._last_rgba: np.ndarray | None = None
+        # Document-space rect the current frame covers (None = whole document).
+        self._src_rect: tuple[int, int, int, int] | None = None
 
         # Text editing overlay state
         self._text_cursor_pos: tuple[int, int] | None = None   # (x, y) in doc coords
@@ -155,13 +157,59 @@ class CanvasView(_BASE_CLASS):
 
     # ---- Public API ---------------------------------------------------------
 
-    def set_image(self, rgba: np.ndarray, force: bool = False) -> None:
+    def visible_doc_rect(self, margin: float = 0.15) -> tuple[int, int, int, int] | None:
+        """Document-space rectangle currently on screen, plus a margin.
+
+        Returns None when the whole document is visible, so the renderer
+        can skip ROI bookkeeping entirely. The margin gives the next frame
+        a little slack during a pan, so small movements do not immediately
+        expose un-rendered edges.
+        """
+        if not self._doc_w or not self._doc_h or self._zoom <= 0:
+            return None
+        dr = self._doc_rect()
+        if (dr.left() >= 0 and dr.top() >= 0
+                and dr.right() <= self.width() and dr.bottom() <= self.height()):
+            return None                      # entire document fits on screen
+        # Widget rect -> document coords
+        x0 = (0 - dr.left()) / self._zoom
+        y0 = (0 - dr.top()) / self._zoom
+        x1 = (self.width() - dr.left()) / self._zoom
+        y1 = (self.height() - dr.top()) / self._zoom
+        mx = (x1 - x0) * margin
+        my = (y1 - y0) * margin
+        x0 = max(0, int(x0 - mx))
+        y0 = max(0, int(y0 - my))
+        x1 = min(self._doc_w, int(x1 + mx) + 1)
+        y1 = min(self._doc_h, int(y1 + my) + 1)
+        if x1 <= x0 or y1 <= y0:
+            return None
+        if x0 == 0 and y0 == 0 and x1 >= self._doc_w and y1 >= self._doc_h:
+            return None
+        return (x0, y0, x1 - x0, y1 - y0)
+
+    def set_image(self, rgba: np.ndarray, force: bool = False,
+                  doc_size: tuple[int, int] | None = None,
+                  src_rect: tuple[int, int, int, int] | None = None) -> None:
+        """Display a composited frame.
+
+        *doc_size* is the document's logical size in document pixels. The
+        frame itself may be a lower-resolution preview, and everything that
+        maps between document and widget coordinates -- selection contours,
+        transform boxes, guides, rulers, tool hit-testing -- works in
+        document space. Deriving the document size from the buffer instead
+        would silently rescale all of it whenever the preview level changed.
+        """
         # Skip redundant QPixmap creation when the buffer is identical
-        if not force and rgba is self._last_rgba:
+        if not force and rgba is self._last_rgba and src_rect == self._src_rect:
             return
         self._last_rgba = rgba
+        self._src_rect = src_rect
         h, w = rgba.shape[:2]
-        self._doc_w, self._doc_h = w, h
+        if doc_size is not None:
+            self._doc_w, self._doc_h = doc_size
+        else:
+            self._doc_w, self._doc_h = w, h
         # Use the buffer directly without .copy() — QPixmap.fromImage
         # copies the data internally so we don't need a second copy.
         qimg = QImage(rgba.data, w, h, w * 4, QImage.Format.Format_RGBA8888)
@@ -509,8 +557,17 @@ class CanvasView(_BASE_CLASS):
         p.drawTiledPixmap(dr.toAlignedRect(), checker_tile())
         p.restore()
 
-        # Document image
-        p.drawPixmap(dr.toAlignedRect(), self._pixmap)
+        # Document image. A partial frame (viewport ROI) covers only part
+        # of the document, so it is drawn into the matching sub-rectangle.
+        if self._src_rect is None:
+            p.drawPixmap(dr.toAlignedRect(), self._pixmap)
+        else:
+            sx, sy, sw, sh = self._src_rect
+            fx = dr.width() / self._doc_w if self._doc_w else 1.0
+            fy = dr.height() / self._doc_h if self._doc_h else 1.0
+            target = QRectF(dr.left() + sx * fx, dr.top() + sy * fy,
+                            sw * fx, sh * fy)
+            p.drawPixmap(target.toAlignedRect(), self._pixmap)
 
         # Selection overlay — marching ants
         if self._sel_contours:
