@@ -69,6 +69,9 @@ class PlanarCompositor:
         # band. Layer preparation is cropped to it, so a zoomed-in view of a
         # large document only converts the pixels it is going to show.
         self._frame_roi: tuple[int, int, int, int] | None = None
+        # When set, only these root layer ids are drawn. Used to composite
+        # the "under" half of the sandwich without mutating the document.
+        self._restrict_to: set[str] | None = None
 
     def _pos(self, position: tuple[int, int]) -> tuple[int, int]:
         """Translate a document-space position into scaled band space.
@@ -414,6 +417,8 @@ class PlanarCompositor:
             and (l.layer_type != LayerType.MASK or l.id in standalone_mask_ids)
             and l.id not in adj_child_ids
         ]
+        if self._restrict_to is not None:
+            visible = [l for l in visible if l.id in self._restrict_to]
         needs_placed: set[str] = set()
         clippable = [
             l for l in visible
@@ -707,21 +712,20 @@ class PlanarCompositor:
                           origin, frame_roi) -> np.ndarray:
         """Composite only *subset* of the root layers, in order.
 
-        Implemented by hiding the other root layers for the duration, so
-        the one compositing routine stays the single source of truth for
-        every clipping, grouping and masking rule.
+        Implemented by restricting the draw list rather than by toggling
+        ``layer.visible``. Hiding layers would mutate the shared document
+        from a render thread: the UI thread reads those same flags to paint
+        the layers panel and to build its own draw list, so a frame rendered
+        during priming could drop layers, and an exception between the
+        hide and the restore would leave the document permanently wrong.
         """
         keep = {l.id for l in subset}
-        hidden = [l for l in self._root_draw_list(stack) if l.id not in keep]
-        saved = [(l, l.visible) for l in hidden]
-        for layer, _ in saved:
-            layer.visible = False
+        self._restrict_to = keep
         try:
             return self.composite(stack, width, height, origin=origin,
                                   level=level, frame_roi=frame_roi).copy()
         finally:
-            for layer, was_visible in saved:
-                layer.visible = was_visible
+            self._restrict_to = None
 
     def _blend_clipped_child(
         self, canvas: np.ndarray, child: Layer, stack: LayerStack,

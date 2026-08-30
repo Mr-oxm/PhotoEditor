@@ -286,3 +286,58 @@ def test_snap_state_is_cleared_on_release():
     tool.on_release(doc, 183, 180)
     assert not tool.snap_engine.active
     assert tool.snap_lines == []
+
+
+def test_a_group_does_not_snap_to_its_own_children():
+    """Snap candidates were gathered before on_press populated the group and
+    multi-selection member lists, so the moving set was incomplete: a group
+    aligned to its own children and could not be nudged at all."""
+    from photo_editor.core.enums import LayerType
+    from photo_editor.tools.move.move_tool import MoveTool
+
+    doc = Document(400, 300, name="grp-snap")
+    doc.layers.layers.clear()
+    group = Layer(name="G", width=400, height=300, layer_type=LayerType.GROUP)
+    doc.layers.add(group)
+    for name, pos in (("K1", (100, 100)), ("K2", (200, 150))):
+        kid = Layer(name=name, width=60, height=60)
+        kid.position = pos
+        kid.parent_id = group.id
+        doc.layers.add(kid)
+    doc.layers.active_index = doc.layers.layers.index(group)
+
+    tool = MoveTool()
+    tool.auto_select = False
+    tool.snap_engine.enabled = True
+    tool.snap_zoom = 1.0
+
+    tool.on_press(doc, 130, 130, 1.0)
+    tool.on_move(doc, 136, 130, 1.0)      # a 6 px nudge
+    moved = [l.position for l in doc.layers if l.parent_id == group.id]
+    tool.on_release(doc, 136, 130)
+
+    assert moved != [(100, 100), (200, 150)], (
+        "the group did not move at all -- it snapped to its own children")
+
+
+def test_snap_candidates_are_gathered_once_per_drag():
+    """Lazily, on the first move -- but still only once. Rebuilding them per
+    event would be O(layers) on the mouse-move path."""
+    from photo_editor.tools.move.move_tool import MoveTool
+
+    doc, a, b = _doc_with_layers()
+    doc.layers.active_index = doc.layers.layers.index(b)
+    tool = MoveTool()
+    tool.auto_select = False
+    tool.snap_engine.enabled = True
+
+    calls = []
+    original = tool.snap_engine.begin
+    tool.snap_engine.begin = lambda *a_, **k: (calls.append(1), original(*a_, **k))[1]
+
+    tool.on_press(doc, 280, 180, 1.0)
+    assert calls == [], "candidates were gathered before the group setup ran"
+    for i in range(6):
+        tool.on_move(doc, 280 - i * 4, 180, 1.0)
+    tool.on_release(doc, 256, 180)
+    assert len(calls) == 1, f"candidates gathered {len(calls)} times in one drag"

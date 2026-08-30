@@ -385,7 +385,9 @@ class DocumentController(ControllerBase):
                 import numpy as np
                 from PIL import Image
 
-                result_f = self.mw._pipeline.execute(self.doc)
+                # Own pipeline: see the note on export above.
+                from ...engine.render_pipeline import RenderPipeline
+                result_f = RenderPipeline().execute(self.doc)
                 data = (np.clip(result_f, 0, 1) * 255).astype(np.uint8)
                 pil = Image.fromarray(data, "RGBA")
                 if target_size:
@@ -415,10 +417,16 @@ class DocumentController(ControllerBase):
             self.ctx.show_status_message("Export failed", 3000)
             QMessageBox.warning(mw, "Export Error", msg)
 
+        # A RenderPipeline is single-owner: it caches into shared buffers
+        # and its compositor carries per-composite state. Handing the
+        # canvas's pipeline to a background export raced it against every
+        # interactive frame. Export gets its own.
+        from ...engine.render_pipeline import RenderPipeline
+        export_pipeline = RenderPipeline()
         self.ctx.execute_command_async(
             SaveDocumentCommand(
                 path,
-                mw._pipeline,
+                export_pipeline,
                 quality=quality,
                 target_size=target_size,
                 jpeg_bg=jpeg_bg,

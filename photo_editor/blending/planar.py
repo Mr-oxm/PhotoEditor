@@ -19,6 +19,8 @@ memory layout and nothing else.
 
 from __future__ import annotations
 
+from collections import OrderedDict
+
 import numpy as np
 
 from ..core.enums import BlendMode
@@ -169,16 +171,26 @@ class PlanarScratch:
     allocation churn during interactive rendering.
     """
 
-    def __init__(self, max_per_shape: int = 3) -> None:
+    def __init__(self, max_per_shape: int = 3,
+                 max_bytes: int = 256 << 20) -> None:
         self._max = max_per_shape
-        self._pools: dict[tuple, list[np.ndarray]] = {}
+        # Bounded by TOTAL bytes as well as per-shape depth. The pool is
+        # keyed by shape, and every distinct viewport size and mip level
+        # produces a new key -- a couple of minutes of zooming and resizing
+        # a 4K document created hundreds of them and the pool grew without
+        # limit. Least-recently-used shapes are dropped first.
+        self._max_bytes = max_bytes
+        self._bytes = 0
+        self._pools: "OrderedDict[tuple, list[np.ndarray]]" = OrderedDict()
 
     def acquire(self, shape: tuple[int, ...],
                 dtype=np.float32, zero: bool = True) -> np.ndarray:
         key = (tuple(shape), np.dtype(dtype))
         pool = self._pools.get(key)
         if pool:
+            self._pools.move_to_end(key)
             buf = pool.pop()
+            self._bytes -= buf.nbytes
             if zero:
                 buf.fill(0)
             return buf
@@ -190,8 +202,23 @@ class PlanarScratch:
             return
         key = (tuple(buf.shape), buf.dtype)
         pool = self._pools.setdefault(key, [])
-        if len(pool) < self._max:
-            pool.append(buf)
+        if len(pool) >= self._max:
+            return              # this shape is already well stocked
+        pool.append(buf)
+        self._bytes += buf.nbytes
+        self._pools.move_to_end(key)
+        self._evict()
+
+    def _evict(self) -> None:
+        """Drop least-recently-used shapes until the pool fits its budget."""
+        while self._bytes > self._max_bytes and len(self._pools) > 1:
+            _, dropped = self._pools.popitem(last=False)
+            for buf in dropped:
+                self._bytes -= buf.nbytes
+
+    def nbytes(self) -> int:
+        return self._bytes
 
     def clear(self) -> None:
         self._pools.clear()
+        self._bytes = 0

@@ -110,10 +110,14 @@ class HistoryManager:
     def _enforce_budget(self, live_ids: set[int] | None = None) -> None:
         """Drop oldest states until history-owned bytes fit the budget.
 
-        Always keeps at least two states so undo remains possible even when
-        a single snapshot exceeds the budget on its own.
+        The floor is ONE state, not two. Keeping two was meant to preserve
+        undo, but on a document where a single snapshot exceeds the budget
+        it held both -- measured at 640 MB against a 64 MB budget, ten times
+        over, which on a small machine is the difference between working and
+        swapping. One retained state still gives a single undo step; the
+        budget is the harder guarantee.
         """
-        while len(self._states) > 2 and self.owned_bytes(live_ids) > self._budget:
+        while len(self._states) > 1 and self.owned_bytes(live_ids) > self._budget:
             self._states.pop(0)
 
     def total_bytes(self) -> int:

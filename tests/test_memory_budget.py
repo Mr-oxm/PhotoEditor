@@ -82,3 +82,56 @@ def test_describe_reports_all_three():
     info = mb.describe()
     assert {"system_mb", "render_cache_mb", "history_mb"} == set(info)
     assert all(v > 0 for v in info.values())
+
+
+def test_planar_scratch_is_bounded_by_bytes():
+    """The pool is keyed by shape, and every distinct viewport size and mip
+    level creates a new key. Without a byte cap, a couple of minutes of
+    zooming and resizing a 4K document grew it without limit."""
+    import numpy as np
+
+    from photo_editor.blending.planar import PlanarScratch
+
+    pool = PlanarScratch(max_per_shape=3, max_bytes=8 << 20)   # 8 MiB
+    for i in range(200):
+        # A different shape every time, as changing zoom produces.
+        buf = np.zeros((4, 64, 64 + i), dtype=np.float32)
+        pool.release(buf)
+    assert pool.nbytes() <= (8 << 20), (
+        f"scratch pool holds {pool.nbytes() / 1e6:.1f} MB against an 8 MB cap")
+
+
+def test_planar_scratch_still_reuses_the_active_shape():
+    """Bounding it must not defeat the point: the shape in active use has
+    to keep being served from the pool."""
+    import numpy as np
+
+    from photo_editor.blending.planar import PlanarScratch
+
+    pool = PlanarScratch(max_per_shape=2, max_bytes=64 << 20)
+    a = pool.acquire((4, 32, 32))
+    ptr = a.__array_interface__["data"][0]
+    pool.release(a)
+    b = pool.acquire((4, 32, 32))
+    assert b.__array_interface__["data"][0] == ptr, "buffer was not reused"
+
+
+def test_history_budget_is_not_overshot_by_the_state_floor():
+    """The floor used to be two states, so a document whose single snapshot
+    exceeds the budget held two of them -- measured ten times over budget,
+    which on a small machine is the difference between working and
+    swapping."""
+    import numpy as np
+
+    from photo_editor.core.history import HistoryManager, HistoryState
+
+    mgr = HistoryManager(budget_bytes=1 << 20)          # 1 MiB
+    for i in range(6):
+        st = HistoryState(name=f"s{i}")
+        st.layer_data["a"] = np.zeros((512, 512, 4), dtype=np.float32)  # 4 MiB
+        st.layer_versions["a"] = i
+        mgr.push(st)
+
+    assert len(mgr.states) == 1, (
+        f"history kept {len(mgr.states)} oversized states against its budget")
+    assert mgr.can_undo is False or len(mgr.states) >= 1

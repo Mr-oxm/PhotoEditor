@@ -55,6 +55,7 @@ class MoveTool(FloatSelectionMixin, ResizeMixin, RotateMixin, VectorCommitMixin,
         self.snap_guides = None
         self.snap_lines: list = []
         self._snap_origin = None
+        self._snap_armed = False
         super().__init__("Move")
         self._mode = _Mode.NONE
         self._handle = _Handle.NONE
@@ -292,7 +293,7 @@ class MoveTool(FloatSelectionMixin, ResizeMixin, RotateMixin, VectorCommitMixin,
         self._start_x, self._start_y = x, y
         self._orig_position = layer.position
         self._dragging = True
-        self._begin_snapping(doc, layer)
+        self._arm_snapping()
         self._active_layer = layer
         self._is_rotated_resize = False
         self._current_angle = 0.0
@@ -581,7 +582,7 @@ class MoveTool(FloatSelectionMixin, ResizeMixin, RotateMixin, VectorCommitMixin,
         is_multi = bool(getattr(self, "_multi_layers", []))
 
         if self._mode == _Mode.MOVE:
-            dx, dy = self._apply_snap(dx, dy)
+            dx, dy = self._apply_snap(dx, dy, doc, layer)
             if self._group_children:
                 # Pseudo-group or real group: move every member via the
                 # stored original positions (the active layer is already
@@ -624,13 +625,27 @@ class MoveTool(FloatSelectionMixin, ResizeMixin, RotateMixin, VectorCommitMixin,
 
     # ---- Snapping ------------------------------------------------------
 
-    def _begin_snapping(self, doc: Document, layer) -> None:
-        """Gather snap candidates once, at the start of the drag.
+    def _arm_snapping(self) -> None:
+        """Mark that this drag wants snapping; candidates come later.
 
-        Collecting them per mouse-move would be O(layers) per event, which
-        is exactly the kind of work the rest of the tool avoids.
+        on_press has several early-return paths and populates the group and
+        multi-selection member lists *after* the point where snapping used
+        to be set up, so the moving set was incomplete: a group snapped to
+        its own children and could not be nudged at all. Collecting the
+        candidates on the first move instead means every path has finished
+        by then.
         """
         self.snap_lines = []
+        self._snap_origin = None
+        self._snap_armed = True
+
+    def _begin_snapping(self, doc: Document, layer) -> None:
+        """Gather snap candidates once, on the first move of a drag.
+
+        Not per mouse-move: that would be O(layers) per event, which is
+        exactly the kind of work the rest of the tool avoids.
+        """
+        self._snap_armed = False
         engine = getattr(self, "snap_engine", None)
         if engine is None or not engine.enabled:
             self._snap_origin = None
@@ -640,15 +655,21 @@ class MoveTool(FloatSelectionMixin, ResizeMixin, RotateMixin, VectorCommitMixin,
         if origin is None:
             self._snap_origin = None
             return
+        # Everything that moves with this drag must be excluded, or the
+        # selection snaps to its own members.
         moving = {layer.id}
         moving.update(l.id for l in getattr(self, "_multi_layers", []) or [])
         moving.update(c.id for c in getattr(self, "_group_children", []) or [])
+        moving.update(m.id for m in getattr(self, "_mask_children", []) or [])
         engine.begin(doc, moving, guides=getattr(self, "snap_guides", None))
         self._snap_origin = origin
 
-    def _apply_snap(self, dx: int, dy: int) -> tuple[int, int]:
+    def _apply_snap(self, dx: int, dy: int, doc: Document = None,
+                    layer=None) -> tuple[int, int]:
         """Nudge the drag offset so edges or centres line up exactly."""
         self.snap_lines = []
+        if getattr(self, "_snap_armed", False) and doc is not None:
+            self._begin_snapping(doc, layer)
         engine = getattr(self, "snap_engine", None)
         origin = getattr(self, "_snap_origin", None)
         if engine is None or origin is None or not engine.active:
@@ -662,6 +683,7 @@ class MoveTool(FloatSelectionMixin, ResizeMixin, RotateMixin, VectorCommitMixin,
         return dx + int(round(result.dx)), dy + int(round(result.dy))
 
     def _end_snapping(self) -> None:
+        self._snap_armed = False
         engine = getattr(self, "snap_engine", None)
         if engine is not None:
             engine.end()

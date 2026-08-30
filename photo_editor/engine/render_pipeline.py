@@ -110,7 +110,7 @@ class RenderPipeline:
             result = self._compositor.composite(
                 document.layers, cw, ch, level=level,
                 origin=origin, frame_roi=lroi)
-        if True:  # MUTATION
+        if epoch == self._epoch:
             self._result_planar = result
             self._planar_valid = True
             self._result_level = level
@@ -184,7 +184,7 @@ class RenderPipeline:
         if self._uint8_buf is None or self._uint8_buf.shape != shape:
             self._uint8_buf = np.empty(shape, dtype=np.uint8)
         _planar_to_uint8(planar, self._uint8_buf)
-        if True:  # MUTATION
+        if epoch == self._epoch:
             self._result_uint8 = self._uint8_buf
             self._uint8_valid = True
             self._result_level = level
