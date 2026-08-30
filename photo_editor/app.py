@@ -119,6 +119,10 @@ def run() -> int:
     if splash:
         splash.finish(window)
 
+    # Offer any work a previous session left behind, once the window is up
+    # so the dialog has a parent to centre on.
+    QTimer.singleShot(0, window.offer_recovery)
+
     return app.exec()
 
 

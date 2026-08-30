@@ -87,6 +87,16 @@ class MainWindow(QMainWindow):
         self._panel_refresh_timer.setSingleShot(True)
         self._panel_refresh_timer.timeout.connect(self._do_deferred_panel_refresh)
         self._panel_refresh_pending = False
+
+        # Autosave. Only viable now that saving a large project takes
+        # seconds on a worker rather than half a minute on the UI thread.
+        from ..utils.autosave import AutosaveManager, purge_stale_markers
+        purge_stale_markers()
+        self._autosave = AutosaveManager()
+        self._autosave_timer = QTimer(self)
+        self._autosave_timer.setInterval(60_000)   # check once a minute
+        self._autosave_timer.timeout.connect(self._run_autosave)
+        self._autosave_timer.start()
         
         # Track whether text editing is active to manage conflicting shortcuts
         self._text_editing_active = False
@@ -454,6 +464,76 @@ class MainWindow(QMainWindow):
         limit_y = span_y / 2.0
         self._canvas.set_pan(QPointF(self._canvas.pan.x(), limit_y - value))
 
+    def _run_autosave(self) -> None:
+        """Autosave every open document that has unsaved changes.
+
+        Runs on a worker so a large project does not stall the UI, and only
+        touches documents that actually changed, so an idle session costs
+        nothing.
+        """
+        session = getattr(self, "_document_session", None)
+        if session is None or getattr(self, "_autosave_busy", False):
+            return
+        pending = []
+        for i in range(len(session)):
+            entry = session.entry_at(i)
+            if entry is None:
+                continue
+            doc = entry.document
+            key = f"{i}-{id(doc):x}"
+            if self._autosave.should_save(key, doc):
+                pending.append((key, doc))
+        if not pending:
+            return
+
+        from ..utils.worker import Worker
+        self._autosave_busy = True
+
+        def run() -> int:
+            for key, doc in pending:
+                self._autosave.save(key, doc)
+            return len(pending)
+
+        def done(count) -> None:
+            self._autosave_busy = False
+            if count:
+                self._status.show_activity("Autosaved", 1500)
+
+        def failed(message: str) -> None:
+            self._autosave_busy = False
+            self._status.show_activity(f"Autosave failed: {message}", 4000)
+
+        Worker.run_async(run, on_result=done, on_error=failed)
+
+    def offer_recovery(self) -> None:
+        """On startup, offer any work left behind by a crashed session."""
+        from ..utils.autosave import find_recoverable
+        try:
+            entries = find_recoverable(
+                exclude_session=self._autosave._session)
+        except Exception:
+            return
+        if not entries:
+            return
+        from .dialogs.recovery_dialog import RecoveryDialog
+        dlg = RecoveryDialog(entries, self)
+        if not dlg.exec():
+            return
+        for entry in dlg.selected_entries():
+            try:
+                self._document_ctrl.on_open_basera(str(entry.doc_path))
+                if self._doc is not None:
+                    # A recovered document is an unsaved copy: it must not
+                    # silently overwrite the file it was recovered from.
+                    self._doc.file_path = None
+                    self._doc.name = entry.name
+                    self._doc.mark_dirty()
+                entry.discard()
+            except Exception:
+                continue
+        if self._doc is not None:
+            self._activate_project()
+
     def _refresh_history_panel(self) -> None:
         if self._doc:
             self._history_panel.refresh(self._doc.history)
@@ -634,6 +714,16 @@ class MainWindow(QMainWindow):
     def _do_deferred_panel_refresh(self) -> None:
         """Timer callback — perform the actual panel refresh."""
         self._panel_refresh_pending = False
+
+        # Autosave. Only viable now that saving a large project takes
+        # seconds on a worker rather than half a minute on the UI thread.
+        from ..utils.autosave import AutosaveManager, purge_stale_markers
+        purge_stale_markers()
+        self._autosave = AutosaveManager()
+        self._autosave_timer = QTimer(self)
+        self._autosave_timer.setInterval(60_000)   # check once a minute
+        self._autosave_timer.timeout.connect(self._run_autosave)
+        self._autosave_timer.start()
         if self._doc:
             self._layers_panel.refresh(self._doc, thumbnails=False)
             self._transform_panel.refresh(self._doc)
@@ -829,4 +919,16 @@ class MainWindow(QMainWindow):
                 event.ignore()
                 return
 
+        # Clean exit: drop this session's autosaves so we do not offer to
+        # "recover" work the user already dealt with.
+        try:
+            self._autosave_timer.stop()
+            self._autosave.release()
+        except Exception:
+            pass
+        try:
+            self._render_scheduler.wait_for_idle(2000)
+            self._pipeline.shutdown()
+        except Exception:
+            pass
         event.accept()
