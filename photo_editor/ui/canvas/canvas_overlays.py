@@ -965,3 +965,40 @@ class CanvasOverlays:
         p.drawText(chip_rect, Qt.AlignmentFlag.AlignCenter, chip_text)
 
         p.restore()
+
+    def draw_snap_lines(self, p, dr) -> None:
+        """Draw the alignment lines produced by a snapped drag.
+
+        Each line spans only the two objects whose relationship it
+        represents, so the overlay reads as "these two edges line up"
+        rather than as a full-canvas grid.
+        """
+        c = self.canvas
+        if not c._snap_lines or not c._doc_w or not c._doc_h:
+            return
+        from ...core.snapping import SnapSource
+
+        sx = dr.width() / c._doc_w
+        sy = dr.height() / c._doc_h
+
+        colours = {
+            SnapSource.CANVAS: QColor(255, 90, 160),
+            SnapSource.LAYER: QColor(255, 90, 160),
+            SnapSource.GUIDE: QColor(90, 200, 255),
+        }
+        p.save()
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        for line in c._snap_lines:
+            pen = QPen(colours.get(line.source, QColor(255, 90, 160)), 1.0)
+            pen.setCosmetic(True)
+            p.setPen(pen)
+            if line.vertical:
+                x = dr.left() + line.position * sx
+                p.drawLine(QPointF(x, dr.top() + line.start * sy),
+                           QPointF(x, dr.top() + line.end * sy))
+            else:
+                y = dr.top() + line.position * sy
+                p.drawLine(QPointF(dr.left() + line.start * sx, y),
+                           QPointF(dr.left() + line.end * sx, y))
+        p.restore()

@@ -129,7 +129,11 @@ class CanvasView(_BASE_CLASS):
         self._alt_held: bool = False                         # Alt modifier is held
 
         # Crop bounding box overlay state
-        self._crop_box: tuple[int, int, int, int] | None = None  # (x, y, w, h) doc coords
+        self._crop_box: tuple[int, int, int, int] | None = None
+
+        # Smart-snapping alignment lines (document coords), shown only while
+        # a drag is actually snapped to something.
+        self._snap_lines: list = []  # (x, y, w, h) doc coords
 
         # Guide lines (list of guide objects with .orientation and .position)
         self._guide_lines: list = []
@@ -293,6 +297,13 @@ class CanvasView(_BASE_CLASS):
     def set_crop_box(self, box: tuple[int, int, int, int] | None) -> None:
         """Set / clear the crop bounding box overlay (doc coords: x, y, w, h)."""
         self._crop_box = box
+        self.update()
+
+    def set_snap_lines(self, lines: list) -> None:
+        """Set the alignment lines to draw during a snapped drag."""
+        if not lines and not self._snap_lines:
+            return
+        self._snap_lines = list(lines)
         self.update()
 
     def set_guides(self, guides: list) -> None:
@@ -667,6 +678,10 @@ class CanvasView(_BASE_CLASS):
         # Guide lines overlay (including preview guide)
         if self._guide_lines or self._preview_guide is not None:
             self._overlays.draw_guides(p, dr)
+
+        # Smart-snapping alignment lines
+        if self._snap_lines:
+            self._overlays.draw_snap_lines(p, dr)
 
         # Vector object overlay (node handles, path outlines)
         if self._current_tool_type in (ToolType.PEN, ToolType.NODE, ToolType.VECTOR_SHAPE, ToolType.MOVE):

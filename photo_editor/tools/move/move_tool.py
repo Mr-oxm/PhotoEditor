@@ -44,6 +44,17 @@ class MoveTool(FloatSelectionMixin, ResizeMixin, RotateMixin, VectorCommitMixin,
     ROTATE_HANDLE_OFFSET = _ht.ROTATE_HANDLE_OFFSET
 
     def __init__(self) -> None:
+        # Smart snapping. Disabled at the tool level and switched on by the
+        # window: the snap threshold is expressed in *screen* pixels, so it
+        # needs the current zoom, and the guide list is view state. Keeping
+        # it off here also means a programmatic drag moves exactly as far as
+        # it was told to.
+        from ...core.snapping import SnapEngine
+        self.snap_engine = SnapEngine(enabled=False)
+        self.snap_zoom: float = 1.0
+        self.snap_guides = None
+        self.snap_lines: list = []
+        self._snap_origin = None
         super().__init__("Move")
         self._mode = _Mode.NONE
         self._handle = _Handle.NONE
@@ -281,6 +292,7 @@ class MoveTool(FloatSelectionMixin, ResizeMixin, RotateMixin, VectorCommitMixin,
         self._start_x, self._start_y = x, y
         self._orig_position = layer.position
         self._dragging = True
+        self._begin_snapping(doc, layer)
         self._active_layer = layer
         self._is_rotated_resize = False
         self._current_angle = 0.0
@@ -569,6 +581,7 @@ class MoveTool(FloatSelectionMixin, ResizeMixin, RotateMixin, VectorCommitMixin,
         is_multi = bool(getattr(self, "_multi_layers", []))
 
         if self._mode == _Mode.MOVE:
+            dx, dy = self._apply_snap(dx, dy)
             if self._group_children:
                 # Pseudo-group or real group: move every member via the
                 # stored original positions (the active layer is already
@@ -608,6 +621,52 @@ class MoveTool(FloatSelectionMixin, ResizeMixin, RotateMixin, VectorCommitMixin,
             else:
                 self._apply_rotate(layer, x, y)
                 self._sync_mask_transforms(layer)
+
+    # ---- Snapping ------------------------------------------------------
+
+    def _begin_snapping(self, doc: Document, layer) -> None:
+        """Gather snap candidates once, at the start of the drag.
+
+        Collecting them per mouse-move would be O(layers) per event, which
+        is exactly the kind of work the rest of the tool avoids.
+        """
+        self.snap_lines = []
+        engine = getattr(self, "snap_engine", None)
+        if engine is None or not engine.enabled:
+            self._snap_origin = None
+            return
+        from .hit_test import bbox
+        origin = bbox(doc)
+        if origin is None:
+            self._snap_origin = None
+            return
+        moving = {layer.id}
+        moving.update(l.id for l in getattr(self, "_multi_layers", []) or [])
+        moving.update(c.id for c in getattr(self, "_group_children", []) or [])
+        engine.begin(doc, moving, guides=getattr(self, "snap_guides", None))
+        self._snap_origin = origin
+
+    def _apply_snap(self, dx: int, dy: int) -> tuple[int, int]:
+        """Nudge the drag offset so edges or centres line up exactly."""
+        self.snap_lines = []
+        engine = getattr(self, "snap_engine", None)
+        origin = getattr(self, "_snap_origin", None)
+        if engine is None or origin is None or not engine.active:
+            return dx, dy
+        ox, oy, ow, oh = origin
+        moved = (float(ox + dx), float(oy + dy), float(ow), float(oh))
+        result = engine.snap(moved, zoom=getattr(self, "snap_zoom", 1.0))
+        if not result.snapped:
+            return dx, dy
+        self.snap_lines = result.lines
+        return dx + int(round(result.dx)), dy + int(round(result.dy))
+
+    def _end_snapping(self) -> None:
+        engine = getattr(self, "snap_engine", None)
+        if engine is not None:
+            engine.end()
+        self.snap_lines = []
+        self._snap_origin = None
 
     def on_release(self, doc: Document, x: int, y: int) -> None:
         # Marquee drag-select: finish and select layers inside the box
@@ -704,6 +763,7 @@ class MoveTool(FloatSelectionMixin, ResizeMixin, RotateMixin, VectorCommitMixin,
         self._multi_base_sy = {}
         self._multi_base_angle = {}
         self._multi_dims = {}
+        self._end_snapping()
 
     # ------------------------------------------------------------------
     # Alignment helpers — delegate to align_ops module

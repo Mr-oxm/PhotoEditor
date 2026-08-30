@@ -234,6 +234,8 @@ class MainWindow(QMainWindow):
         # Rulers default visible
         self._rulers_visible = True
         self._guides: list = []
+        # Smart snapping while dragging layers (View > Snap to Objects).
+        self._snap_enabled = True
 
         # Ruler/guide signals wired by ViewController
 

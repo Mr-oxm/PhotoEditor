@@ -156,6 +156,7 @@ class EditorMenuBar(QMenuBar):
         self._add(m, "toggle_grid", "Show &Grid")
         self._add(m, "toggle_rulers", "Show &Rulers")
         self._add(m, "toggle_guides", "Show G&uides")
+        self._add(m, "toggle_snapping", "S&nap to Objects")
         m.addSeparator()
         
         from .theme import THEMES
