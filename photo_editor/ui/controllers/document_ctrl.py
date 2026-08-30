@@ -16,6 +16,17 @@ _IMG_FLT = "Images (*.png *.jpg *.jpeg *.webp *.tiff *.tif *.bmp)"
 _BASERA_FLT = "Basera Projects (*.basera)"
 
 
+def _document_revision(doc) -> tuple:
+    """A value that changes whenever the document's content changes.
+
+    Layer content versions are process-wide monotonic and move on every
+    edit, so their maximum is a reliable revision marker. History depth is
+    NOT: it stops growing once the byte budget starts evicting states.
+    """
+    versions = [getattr(l, "content_version", 0) for l in doc.layers]
+    return (max(versions) if versions else 0, len(list(doc.layers)))
+
+
 class DocumentController(ControllerBase):
     """Handles new/open/save/close, tabs, and undo/redo."""
 
@@ -215,39 +226,140 @@ class DocumentController(ControllerBase):
             self._save_basera(path)
 
     def _save_basera(self, path: str) -> None:
-        """Save the project to *path* synchronously.
+        """Save the project to *path* without blocking the UI.
 
-        The v3 ZIP format is fast enough to run on the main thread —
-        no background worker, no signal race conditions, no callbacks.
+        Saving used to run inline on the main thread. For a 20-layer 4K
+        project that measured 32 s of DEFLATE with the whole window frozen
+        and the status message unable to repaint. The v4 format cut the
+        work substantially, but a large project is still seconds of I/O, so
+        it belongs on a worker.
+
+        The document is not mutated during the save, and the layer buffers
+        it reads are frozen by the undo system's copy-on-write, so an edit
+        made while a save is running copies rather than overwriting the
+        bytes being written.
         """
         if not self.doc:
             return
         from ...utils.project_io import save_basera_project
+        from ...utils.worker import Worker
+
+        if getattr(self, "_saving", False):
+            self.ctx.show_status_message("A save is already in progress…", 2000)
+            return
+        self._saving = True
+
+        doc = self.doc
+        name = Path(path).name
+        # What the document looked like when the save started. Edits made
+        # during a multi-second save must NOT be marked saved when it
+        # finishes, or the user quits without a prompt and loses them.
+        token = _document_revision(doc)
+        # The worker reads these buffers for several seconds while the user
+        # keeps painting. Freezing makes the next edit copy-on-write instead
+        # of mutating underneath the writer.
+        doc.freeze_for_read()
+        self.ctx.show_status_message(f"Saving {name}…", 0)
+
+        def run() -> str:
+            save_basera_project(doc, path)
+            return path
+
+        def on_result(_result) -> None:
+            self._saving = False
+            self._after_save_succeeded(doc, path, saved_revision=token)
+
+        def on_error(message: str) -> None:
+            self._saving = False
+            self.ctx.show_status_message("Save failed", 3000)
+            QMessageBox.warning(self.mw, "Save Error", str(message))
+
+        Worker.run_async(run, on_result=on_result, on_error=on_error)
+
+    def _after_save_succeeded(self, doc, path: str,
+                              saved_revision=None) -> None:
+        """UI bookkeeping once a save has completed.
+
+        *saved_revision* is the document's revision when the save started.
+        The document is only marked clean if it has not changed since --
+        otherwise a stroke made during a four-second save would be recorded
+        as saved and lost on quit without a prompt.
+        """
         from ...utils.recent_projects import add_recent_project
 
-        self.ctx.show_status_message(f"Saving {Path(path).name}…", 0)
+        doc.file_path = path
+        unchanged = (saved_revision is None
+                     or _document_revision(doc) == saved_revision)
+        if unchanged:
+            doc.mark_clean()
+            # Genuinely on disk: drop the autosave so a later crash does not
+            # offer this work back as if it had never been saved.
+            self._forget_autosave(doc)
+        else:
+            self.ctx.show_status_message(
+                f"Saved {Path(path).name} — later edits are still unsaved",
+                3000)
+        self.ctx.set_window_title(f"Basera — {Path(path).name}")
+        # The tab holding THIS document, not whichever is current when the
+        # background save finishes. The user may well have switched tabs
+        # during a multi-second save, and renaming the active tab instead
+        # rewrites the wrong document's path.
+        idx = self._tab_index_for(doc)
+        if idx >= 0:
+            self._session.update_path(idx, path)
+            self._session.update_tab_metadata(
+                idx, title=Path(path).name, tooltip=path,
+            )
         try:
-            save_basera_project(self.doc, path)
-
-            self.doc.file_path = path
-            self.doc.mark_clean()
-            self.ctx.set_window_title(f"Basera — {Path(path).name}")
-            idx = self._session.current_index()
-            if idx >= 0:
-                self._session.update_path(idx, path)
-                self._session.update_tab_metadata(
-                    idx, title=Path(path).name, tooltip=path,
-                )
-            try:
-                add_recent_project(path)
-                if hasattr(self.mw, '_refresh_recent_projects'):
-                    self.mw._refresh_recent_projects()
-            except Exception:
-                pass
+            add_recent_project(path)
+            if hasattr(self.mw, '_refresh_recent_projects'):
+                self.mw._refresh_recent_projects()
+        except Exception:
+            pass
+        if unchanged:
             self.ctx.show_status_message(f"Saved {Path(path).name}", 2000)
-        except Exception as exc:
-            self.ctx.show_status_message("Save failed", 3000)
+
+    def _tab_index_for(self, doc) -> int:
+        """Index of the tab holding *doc*, or -1."""
+        session = self._session
+        if session is None:
+            return -1
+        for i in range(len(session)):
+            entry = session.entry_at(i)
+            if entry is not None and entry.document is doc:
+                return i
+        return -1
+
+    def _forget_autosave(self, doc) -> None:
+        """Drop *doc*'s autosave now that it is on disk."""
+        manager = getattr(self.mw, "_autosave", None)
+        session = getattr(self.mw, "_document_session", None)
+        if manager is None or session is None:
+            return
+        for i in range(len(session)):
+            entry = session.entry_at(i)
+            if entry is not None and entry.document is doc:
+                manager.forget(f"{i}-{id(doc):x}")
+                return
+
+    def _save_basera_blocking(self, doc, path: str) -> bool:
+        """Save *doc* synchronously and report whether it succeeded.
+
+        Used on the quit path, which must not return before the bytes are
+        on disk -- an asynchronous save there would let the process exit
+        mid-write and lose the user's work.
+        """
+        if doc is None:
+            return False
+        from ...utils.project_io import save_basera_project
+        token = _document_revision(doc)
+        try:
+            save_basera_project(doc, path)
+        except Exception as exc:  # noqa: BLE001
             QMessageBox.warning(self.mw, "Save Error", str(exc))
+            return False
+        self._after_save_succeeded(doc, path, saved_revision=token)
+        return True
 
     def on_export(self) -> None:
         """Open the export dialog."""
@@ -292,7 +404,9 @@ class DocumentController(ControllerBase):
                 import numpy as np
                 from PIL import Image
 
-                result_f = self.mw._pipeline.execute(self.doc)
+                # Own pipeline: see the note on export above.
+                from ...engine.render_pipeline import RenderPipeline
+                result_f = RenderPipeline().execute(self.doc)
                 data = (np.clip(result_f, 0, 1) * 255).astype(np.uint8)
                 pil = Image.fromarray(data, "RGBA")
                 if target_size:
@@ -322,10 +436,16 @@ class DocumentController(ControllerBase):
             self.ctx.show_status_message("Export failed", 3000)
             QMessageBox.warning(mw, "Export Error", msg)
 
+        # A RenderPipeline is single-owner: it caches into shared buffers
+        # and its compositor carries per-composite state. Handing the
+        # canvas's pipeline to a background export raced it against every
+        # interactive frame. Export gets its own.
+        from ...engine.render_pipeline import RenderPipeline
+        export_pipeline = RenderPipeline()
         self.ctx.execute_command_async(
             SaveDocumentCommand(
                 path,
-                mw._pipeline,
+                export_pipeline,
                 quality=quality,
                 target_size=target_size,
                 jpeg_bg=jpeg_bg,
@@ -575,11 +695,14 @@ class DocumentController(ControllerBase):
         return "cancel"
 
     def _save_basera_sync(self, doc) -> bool:
-        """Resolve a save path for *doc* and write it.
+        """Resolve a save path for *doc* and write it, blocking until done.
 
         Uses the document's existing file_path when it is a .basera path;
         otherwise opens a Save As dialog.  Returns True on success,
-        False if the user cancelled or save failed.
+        False if the user cancelled or the save failed.
+
+        This is the quit path: it must block, because returning early would
+        let the application exit while the file is still being written.
         """
         path = doc.file_path if (doc.file_path and doc.file_path.endswith(".basera")) else None
         if not path:
@@ -591,12 +714,7 @@ class DocumentController(ControllerBase):
             if not path.endswith(".basera"):
                 path += ".basera"
 
-        try:
-            self._save_basera(path)
-            return True
-        except Exception as exc:
-            QMessageBox.warning(self.mw, "Save Error", str(exc))
-            return False
+        return self._save_basera_blocking(doc, path)
 
     def on_undo(self) -> None:
         if self.doc:

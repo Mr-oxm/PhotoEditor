@@ -1,0 +1,115 @@
+{
+  "name": "baseline-composite",
+  "env": {
+    "python": "3.13.15",
+    "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+    "machine": "arm64",
+    "cpu_count": 14,
+    "numpy": "2.4.2",
+    "opencv": "4.13.0",
+    "cv2_threads": 14,
+    "pyside6": "6.10.2"
+  },
+  "results": [
+    {
+      "name": "blend_NORMAL_4K",
+      "iterations": 3,
+      "best_ms": 230.658,
+      "median_ms": 232.744,
+      "mean_ms": 233.17,
+      "fps": 4.3,
+      "blend_mode": "NORMAL",
+      "width": 3840,
+      "height": 2160
+    },
+    {
+      "name": "blend_MULTIPLY_4K",
+      "iterations": 3,
+      "best_ms": 262.75,
+      "median_ms": 265.187,
+      "mean_ms": 266.948,
+      "fps": 3.77,
+      "blend_mode": "MULTIPLY",
+      "width": 3840,
+      "height": 2160
+    },
+    {
+      "name": "blend_OVERLAY_4K",
+      "iterations": 3,
+      "best_ms": 360.136,
+      "median_ms": 361.733,
+      "mean_ms": 361.465,
+      "fps": 2.76,
+      "blend_mode": "OVERLAY",
+      "width": 3840,
+      "height": 2160
+    },
+    {
+      "name": "blend_SOFT_LIGHT_4K",
+      "iterations": 3,
+      "best_ms": 474.623,
+      "median_ms": 478.788,
+      "mean_ms": 477.885,
+      "fps": 2.09,
+      "blend_mode": "SOFT_LIGHT",
+      "width": 3840,
+      "height": 2160
+    },
+    {
+      "name": "blend_COLOR_4K",
+      "iterations": 3,
+      "best_ms": 562.418,
+      "median_ms": 573.227,
+      "mean_ms": 572.487,
+      "fps": 1.74,
+      "blend_mode": "COLOR",
+      "width": 3840,
+      "height": 2160
+    },
+    {
+      "name": "history_snapshot_1L_4K",
+      "iterations": 3,
+      "best_ms": 2.608,
+      "median_ms": 9.839,
+      "mean_ms": 7.613,
+      "fps": 101.64,
+      "layers": 1,
+      "history_mb": 379.7,
+      "per_state_mb": 126.6,
+      "projected_full_history_mb": 6328.1,
+      "rss_delta_mb": 253.2
+    },
+    {
+      "name": "history_snapshot_5L_4K",
+      "iterations": 3,
+      "best_ms": 83.241,
+      "median_ms": 91.593,
+      "mean_ms": 93.521,
+      "fps": 10.92,
+      "layers": 5,
+      "history_mb": 1898.4,
+      "per_state_mb": 632.8,
+      "projected_full_history_mb": 31640.6,
+      "rss_delta_mb": 1772.1
+    },
+    {
+      "name": "history_snapshot_20L_4K",
+      "iterations": 3,
+      "best_ms": 609.825,
+      "median_ms": 666.695,
+      "mean_ms": 650.949,
+      "fps": 1.5,
+      "layers": 20,
+      "history_mb": 7593.8,
+      "per_state_mb": 2531.2,
+      "projected_full_history_mb": 126562.5,
+      "rss_delta_mb": 2605.0
+    },
+    {
+      "name": "memory_20L_4K",
+      "layer_pixel_mb": 2531.2,
+      "rss_delta_mb": 0.0,
+      "theoretical_float32_mb": 2531.2
+    }
+  ]
+}

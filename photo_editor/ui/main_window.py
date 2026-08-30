@@ -62,8 +62,8 @@ class MainWindow(QMainWindow):
         self._pipeline = RenderPipeline()
         self._render_scheduler = RenderScheduler(
             self._pipeline,
-            interval_ms=33,
-            preview_max_size=0,  # Full res for now; set to 2048 when coord scaling is ready
+            interval_ms=16,          # ~60 fps ceiling
+            preview_max_size=2048,   # replaced per-frame by _sync_preview_level
         )
         self._tools = ToolManager()
 
@@ -87,6 +87,16 @@ class MainWindow(QMainWindow):
         self._panel_refresh_timer.setSingleShot(True)
         self._panel_refresh_timer.timeout.connect(self._do_deferred_panel_refresh)
         self._panel_refresh_pending = False
+
+        # Autosave. Only viable now that saving a large project takes
+        # seconds on a worker rather than half a minute on the UI thread.
+        from ..utils.autosave import AutosaveManager, purge_stale_markers
+        purge_stale_markers()
+        self._autosave = AutosaveManager()
+        self._autosave_timer = QTimer(self)
+        self._autosave_timer.setInterval(60_000)   # check once a minute
+        self._autosave_timer.timeout.connect(self._run_autosave)
+        self._autosave_timer.start()
         
         # Track whether text editing is active to manage conflicting shortcuts
         self._text_editing_active = False
@@ -224,6 +234,8 @@ class MainWindow(QMainWindow):
         # Rulers default visible
         self._rulers_visible = True
         self._guides: list = []
+        # Smart snapping while dragging layers (View > Snap to Objects).
+        self._snap_enabled = True
 
         # Ruler/guide signals wired by ViewController
 
@@ -398,10 +410,43 @@ class MainWindow(QMainWindow):
         self._status.zoom_to_mouse = self._canvas.zoom_to_mouse
         # Guide drag wired by ViewController
 
+    def _sync_preview_level(self) -> None:
+        """Match the render resolution to what the screen actually shows.
+
+        Compositing a 4K document at 4K while displaying it at 40% zoom does
+        six times the necessary work. Conversely, rendering a fixed-size
+        preview would go soft the moment the user zooms in. So the target is
+        simply the document's on-screen size: never fewer pixels than are
+        displayed, never many more.
+        """
+        if not self._doc:
+            return
+        longest = max(self._doc.width, self._doc.height)
+        target = int(longest * self._canvas.zoom)
+        # Clamp up to a floor so a very zoomed-out view still has enough
+        # detail for the layer panel and for zooming back in smoothly.
+        target = max(512, min(target, longest))
+        self._render_scheduler.set_preview_max_size(target)
+        # Only composite what is on screen. At 100% zoom a 4K document
+        # shows a fraction of its pixels; rendering the rest is waste.
+        self._render_scheduler.set_roi(self._canvas.visible_doc_rect())
+
     def _on_canvas_view_changed(self) -> None:
         self._view_ctrl.update_rulers()
         self._status.set_zoom(self._canvas.zoom)
         self._sync_canvas_scrollbars()
+        previous = (self._render_scheduler.preview_max_size,
+                    self._render_scheduler._roi)
+        self._sync_preview_level()
+        current = (self._render_scheduler.preview_max_size,
+                   self._render_scheduler._roi)
+        # Rendering is now scoped to the visible region at a zoom-dependent
+        # mip level, so panning and zooming change WHAT must be composited --
+        # not just how it is drawn. Without a new frame the canvas keeps
+        # showing the region that was visible before the view moved.
+        if current != previous and self._doc is not None:
+            self._pipeline.invalidate()
+            self._render_scheduler.enqueue_render(self._doc)
 
     def _sync_canvas_scrollbars(self) -> None:
         span_x, span_y = self._canvas.scrollable_span()
@@ -431,6 +476,86 @@ class MainWindow(QMainWindow):
         _, span_y = self._canvas.scrollable_span()
         limit_y = span_y / 2.0
         self._canvas.set_pan(QPointF(self._canvas.pan.x(), limit_y - value))
+
+    def _run_autosave(self) -> None:
+        """Autosave every open document that has unsaved changes.
+
+        Runs on a worker so a large project does not stall the UI, and only
+        touches documents that actually changed, so an idle session costs
+        nothing.
+        """
+        session = getattr(self, "_document_session", None)
+        if session is None or getattr(self, "_autosave_busy", False):
+            return
+        pending = []
+        for i in range(len(session)):
+            entry = session.entry_at(i)
+            if entry is None:
+                continue
+            doc = entry.document
+            key = f"{i}-{id(doc):x}"
+            if self._autosave.should_save(key, doc):
+                pending.append((key, doc))
+        if not pending:
+            return
+
+        from ..utils.worker import Worker
+        self._autosave_busy = True
+
+        def run() -> int:
+            for key, doc in pending:
+                self._autosave.save(key, doc)
+            return len(pending)
+
+        def done(count) -> None:
+            self._autosave_busy = False
+            if count:
+                self._status.show_activity("Autosaved", 1500)
+
+        def failed(message: str) -> None:
+            self._autosave_busy = False
+            self._status.show_activity(f"Autosave failed: {message}", 4000)
+
+        Worker.run_async(run, on_result=done, on_error=failed)
+
+    def offer_recovery(self) -> None:
+        """On startup, offer any work left behind by a crashed session."""
+        from ..utils.autosave import find_recoverable
+        try:
+            entries = find_recoverable(
+                exclude_session=self._autosave._session)
+        except Exception:
+            return
+        if not entries:
+            return
+        from .dialogs.recovery_dialog import RecoveryDialog
+        dlg = RecoveryDialog(entries, self)
+        if not dlg.exec():
+            return
+        for entry in dlg.selected_entries():
+            # on_open_basera reports failures with a dialog rather than
+            # raising, so "no exception" does not mean "it opened". Confirm
+            # a new document actually arrived before discarding the file --
+            # it is the only copy of the user's crashed work.
+            before = len(self._document_session or ())
+            try:
+                self._document_ctrl.on_open_basera(str(entry.doc_path))
+            except Exception:
+                continue
+            opened = len(self._document_session or ()) > before
+            if not opened or self._doc is None:
+                self._status.show_activity(
+                    f"Could not recover \"{entry.name}\" — its autosave has "
+                    f"been kept", 6000)
+                continue
+            # A recovered document is an unsaved copy: it must not silently
+            # overwrite the file it was recovered from.
+            self._doc.file_path = None
+            self._doc.name = entry.name
+            self._doc.mark_dirty()
+            entry.discard()
+        if self._doc is not None:
+            self._activate_project()
 
     def _refresh_history_panel(self) -> None:
         if self._doc:
@@ -469,12 +594,15 @@ class MainWindow(QMainWindow):
             # async render runs.  The render callback will then refresh
             # again with thumbnails once the composite is ready.
             self._layers_panel.refresh(self._doc, thumbnails=False)
+            self._sync_preview_level()
             self._pipeline.invalidate(layer_id)
             self._render_scheduler.enqueue_render(self._doc, full_refresh=True)
         else:
             # Cache hit — sync path is fast
             result = self._pipeline.execute_to_uint8(self._doc)
-            self._canvas.set_image(result, force=False)
+            self._canvas.set_image(
+                result, force=False,
+                doc_size=(self._doc.width, self._doc.height), src_rect=None)
             self._layers_panel.refresh(self._doc)
             self._history_panel.refresh(self._doc.history)
             self._transform_panel.refresh(self._doc)
@@ -487,6 +615,7 @@ class MainWindow(QMainWindow):
         """Re-render and update canvas only (skip panel updates). Async."""
         if not self._doc:
             return
+        self._sync_preview_level()
         active = self._doc.layers.active_layer
         self._pipeline.invalidate(active.id if active else None)
         self._render_scheduler.enqueue_render(self._doc, full_refresh=False)
@@ -500,33 +629,49 @@ class MainWindow(QMainWindow):
         self._render_scheduler.enqueue_render(self._doc, full_refresh=False)
 
     def _schedule_render(self) -> None:
-        """Request a deferred render (throttled ~30fps, off UI thread)."""
+        """Request a deferred render (throttled, off the UI thread)."""
         if not self._doc:
             return
+        self._sync_preview_level()
         active = self._doc.layers.active_layer
         self._pipeline.invalidate(active.id if active else None)
         self._render_scheduler.enqueue_render(self._doc, full_refresh=False)
 
-    def _on_render_ready(self, rgba, _gen_id: int, full_refresh: bool) -> None:
+    def _on_render_ready(self, rgba, _gen_id: int, full_refresh: bool,
+                         doc_w: int = 0, doc_h: int = 0,
+                         src_rect=None) -> None:
         """Render worker completed — update canvas and optionally panels."""
         if not self._doc:
             return
-        self._canvas.set_image(rgba, force=True)
+        # The frame may be a downscaled preview covering only the visible
+        # region; the canvas still needs the document's logical size for all
+        # coordinate mapping, plus the rect the buffer actually covers.
+        self._canvas.set_image(
+            rgba, force=True,
+            doc_size=(doc_w, doc_h) if doc_w and doc_h
+            else (self._doc.width, self._doc.height),
+            src_rect=src_rect,
+        )
         self._sync_canvas_scrollbars()
+        # Overlays track the frame and are cheap now that the selection
+        # caches its contours and bounds.
         self._selection_ctrl.update_selection_overlay()
         self._transform_ctrl.update_transform_box()
-        self._transform_panel.refresh(self._doc)
-        self._channels_panel.refresh(self._doc)
-        self._view_ctrl.update_rulers()
+        # The transform, channels and history panels depend on document
+        # state, not on the rendered pixels, so refreshing them once per
+        # frame was pure waste -- the channels panel even re-composited the
+        # active group each time. They are coalesced to ~5 fps instead.
+        self._schedule_panel_refresh()
         if full_refresh:
             self._layers_panel.refresh(self._doc)
-            self._history_panel.refresh(self._doc.history)
 
     def _on_render_error(self, message: str) -> None:
         """Render worker failed — fallback to sync render."""
         if self._doc:
             result = self._pipeline.execute_to_uint8(self._doc)
-            self._canvas.set_image(result, force=True)
+            self._canvas.set_image(
+                result, force=True,
+                doc_size=(self._doc.width, self._doc.height), src_rect=None)
             self._sync_canvas_scrollbars()
         self._status.show_activity(f"Render error: {message}", 3000)
 
@@ -597,6 +742,7 @@ class MainWindow(QMainWindow):
             self._transform_panel.refresh(self._doc)
             self._channels_panel.refresh(self._doc)
             self._history_panel.refresh(self._doc.history)
+            self._view_ctrl.update_rulers()
 
     # ---- Key event handling -------------------------------------------------
 
@@ -736,6 +882,14 @@ class MainWindow(QMainWindow):
     def _on_last_tab_closed(self) -> None:
         """Called when the last tab is closed — return to welcome screen."""
         self._doc = None
+        # With no document open there is nothing the caches can serve, and
+        # they can be holding the whole render-cache budget while the user
+        # stares at the welcome screen.
+        try:
+            self._pipeline.end_interaction()
+            self._pipeline.invalidate()
+        except Exception:
+            pass
         if not self._dev_mode:
             self._show_welcome_screen()
 
@@ -786,4 +940,16 @@ class MainWindow(QMainWindow):
                 event.ignore()
                 return
 
+        # Clean exit: drop this session's autosaves so we do not offer to
+        # "recover" work the user already dealt with.
+        try:
+            self._autosave_timer.stop()
+            self._autosave.release()
+        except Exception:
+            pass
+        try:
+            self._render_scheduler.wait_for_idle(2000)
+            self._pipeline.shutdown()
+        except Exception:
+            pass
         event.accept()

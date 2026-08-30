@@ -199,17 +199,78 @@ class TestV3Format:
         with zipfile.ZipFile(p) as zf:
             manifest = json.loads(zf.read("manifest.json"))
         assert manifest["magic"] == "BASERA_PROJECT"
-        assert manifest["version"] == 3
+        assert manifest["version"] == 4
 
-    def test_layer_pixels_stored_as_npy(self, tmp_path):
+    def test_layer_pixels_stored_as_compressed_npy(self, tmp_path):
+        """v4 stores zlib-compressed .npy payloads in an uncompressed ZIP."""
         from photo_editor.utils.project_io import save_basera_project
         doc = _make_document()
-        layer = doc.add_layer(name="Raster")
+        doc.add_layer(name="Raster")
         p = tmp_path / "test.basera"
         save_basera_project(doc, p)
         with zipfile.ZipFile(p) as zf:
-            npy_entries = [n for n in zf.namelist() if n.endswith(".npy")]
-        assert len(npy_entries) >= 1, "Pixel data must be stored as .npy files"
+            entries = [n for n in zf.namelist() if n.endswith(".npy.z")]
+            assert entries, "pixel data must be stored as .npy.z entries"
+            for info in zf.infolist():
+                if info.filename.endswith(".npy.z"):
+                    assert info.compress_type == zipfile.ZIP_STORED, (
+                        "payloads are already zlib-compressed; the container "
+                        "must not compress them again")
+
+    def test_pixels_stored_as_uint16(self, tmp_path):
+        """float32 image data is 4x larger than needed and barely
+        compressible; uint16 is effectively lossless for [0, 1] data."""
+        import io
+        import zlib
+        import numpy as np
+        from photo_editor.utils.project_io import save_basera_project
+        doc = _make_document()
+        layer = doc.add_layer(name="Raster")
+        _fill_pixels(layer)
+        p = tmp_path / "test.basera"
+        save_basera_project(doc, p)
+        with zipfile.ZipFile(p) as zf:
+            name = next(n for n in zf.namelist()
+                        if n.endswith(f"{layer.id}.npy.z"))
+            arr = np.load(io.BytesIO(zlib.decompress(zf.read(name))))
+        assert arr.dtype == np.uint16, f"stored as {arr.dtype}, expected uint16"
+
+    def test_out_of_range_pixels_are_stored_losslessly(self, tmp_path):
+        """Values outside [0, 1] must not be silently clipped by quantising."""
+        import numpy as np
+        from photo_editor.utils.project_io import (
+            load_basera_project, save_basera_project,
+        )
+        doc = _make_document()
+        layer = doc.add_layer(name="HDR")
+        px = np.zeros((layer.height, layer.width, 4), dtype=np.float32)
+        px[..., 0] = 3.5          # deliberately out of range
+        px[..., 3] = 1.0
+        layer.pixels = px
+        p = tmp_path / "hdr.basera"
+        save_basera_project(doc, p)
+        loaded = load_basera_project(p)
+        rl = next(l for l in loaded.layers if l.name == "HDR")
+        assert np.allclose(rl.pixels[..., 0], 3.5, atol=1e-5), (
+            "out-of-range data was clipped by quantisation")
+
+    def test_uint16_round_trip_is_visually_lossless(self, tmp_path):
+        import numpy as np
+        from photo_editor.utils.project_io import (
+            load_basera_project, save_basera_project,
+        )
+        rng = np.random.default_rng(0)
+        doc = _make_document()
+        layer = doc.add_layer(name="Noise")
+        px = rng.random((layer.height, layer.width, 4)).astype(np.float32)
+        layer.pixels = px
+        p = tmp_path / "noise.basera"
+        save_basera_project(doc, p)
+        loaded = load_basera_project(p)
+        rl = next(l for l in loaded.layers if l.name == "Noise")
+        err = float(np.abs(rl.pixels - px).max())
+        assert err < 1.0 / 255.0 / 100.0, (
+            f"round-trip error {err:.8f} exceeds 1% of an 8-bit level")
 
     def test_no_history_in_manifest(self, tmp_path):
         import json
@@ -717,3 +778,146 @@ class TestSaveCrashResilience:
         assert "Saved" in status_messages, (
             "The 'Saved' status must fire even when the callback crashes"
         )
+
+
+def test_concurrent_saves_do_not_share_a_temp_path(tmp_path):
+    """A background Ctrl+S and the blocking save on quit both target the same
+    file. With a shared '<target>.tmp' the second writer truncated the first
+    one's partial archive and os.replace() published whichever finished last
+    -- a corrupt project either way."""
+    import threading
+
+    import numpy as np
+    from photo_editor.utils.project_io import (
+        load_basera_project, save_basera_project,
+    )
+
+    target = tmp_path / "shared.basera"
+    docs = []
+    for value in (0.25, 0.75):
+        doc = _make_document()
+        layer = doc.add_layer(name="L")
+        layer.pixels[:] = np.array([value] * 4, dtype=np.float32)
+        docs.append(doc)
+
+    errors = []
+
+    def save(doc):
+        try:
+            save_basera_project(doc, target)
+        except Exception as exc:      # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=save, args=(d,)) for d in docs]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, f"concurrent saves raised: {errors}"
+    # Whichever won, the file must be a complete, loadable project.
+    loaded = load_basera_project(target)
+    assert any(l.name == "L" for l in loaded.layers)
+    assert not list(tmp_path.glob("*.tmp")), "temp files were left behind"
+
+
+class TestSaveDirtyTracking:
+    """A multi-second background save must not swallow edits made during it."""
+
+    def _win(self, qtbot):
+        from photo_editor.ui.main_window import MainWindow
+        win = MainWindow(dev_mode=True)
+        qtbot.addWidget(win)
+        win._autosave_timer.stop()
+        return win
+
+    def test_edits_during_a_save_are_still_unsaved(self, qtbot, tmp_path):
+        """The document was marked clean when the save finished regardless of
+        what happened meanwhile, so a stroke made during a four-second save
+        was recorded as saved and lost on quit without a prompt."""
+        import numpy as np
+
+        win = self._win(qtbot)
+        try:
+            doc = win._doc
+            layer = doc.layers.active_layer
+            layer.begin_write()
+            layer.pixels[:] = 0.25
+            doc.mark_dirty()
+
+            ctrl = win._document_ctrl
+            token = ctrl.__class__.__module__  # noqa: F841 - import guard
+            from photo_editor.ui.controllers.document_ctrl import (
+                _document_revision,
+            )
+            revision = _document_revision(doc)
+
+            # An edit lands while the save is in flight.
+            layer.begin_write()
+            layer.pixels[:] = 0.75
+
+            ctrl._after_save_succeeded(doc, str(tmp_path / "x.basera"),
+                                       saved_revision=revision)
+            assert doc.dirty, (
+                "an edit made during the save was marked as saved")
+        finally:
+            win._doc.mark_clean()
+
+    def test_an_untouched_document_is_marked_clean(self, qtbot, tmp_path):
+        win = self._win(qtbot)
+        try:
+            from photo_editor.ui.controllers.document_ctrl import (
+                _document_revision,
+            )
+            doc = win._doc
+            doc.mark_dirty()
+            revision = _document_revision(doc)
+            win._document_ctrl._after_save_succeeded(
+                doc, str(tmp_path / "y.basera"), saved_revision=revision)
+            assert not doc.dirty
+        finally:
+            win._doc.mark_clean()
+
+
+def test_editing_during_a_save_does_not_tear_the_file(tmp_path):
+    """A background save reads layer pixels for seconds while the user keeps
+    painting. Painting writes in place, so the file could contain
+    half-finished strokes. Freezing before the save makes the next edit
+    copy-on-write instead of mutating underneath the writer."""
+    import numpy as np
+    from photo_editor.utils.project_io import (
+        load_basera_project, save_basera_project,
+    )
+
+    doc = _make_document()
+    layer = doc.add_layer(name="Painted")
+    layer.pixels[:] = np.array([0.25, 0.25, 0.25, 1.0], dtype=np.float32)
+
+    doc.freeze_for_read()
+    # Exactly what a save worker holds: a reference to the live array.
+    writer_sees = layer.pixels
+    expected = writer_sees.copy()
+    assert not writer_sees.flags.writeable, "freeze_for_read did not freeze"
+
+    # A stroke lands "during" the save.
+    layer.begin_write()
+    layer.pixels[:] = np.array([0.9, 0.1, 0.1, 1.0], dtype=np.float32)
+
+    np.testing.assert_array_equal(
+        writer_sees, expected,
+        "the buffer a save worker is reading was mutated in place")
+    assert layer.pixels is not writer_sees, "begin_write did not un-share"
+
+    target = tmp_path / "torn.basera"
+    save_basera_project(doc, target)
+    loaded = load_basera_project(target)
+    assert any(l.name == "Painted" for l in loaded.layers)
+
+
+def test_freeze_for_read_does_not_add_history(tmp_path):
+    """Freezing is not a snapshot -- it must not grow the undo stack."""
+    doc = _make_document()
+    doc.add_layer(name="L")
+    before = len(doc.history.states)
+    doc.freeze_for_read()
+    assert len(doc.history.states) == before

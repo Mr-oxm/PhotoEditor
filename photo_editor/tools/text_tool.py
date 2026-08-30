@@ -529,10 +529,11 @@ class TextTool(Tool):
         need_h = max(rh, td.box_height)
         need_w = max(rw, td.box_width)
         if layer.width != need_w or layer.height != need_h:
-            layer._pixels = np.zeros((need_h, need_w, 4), dtype=np.float32)
-            layer.width = need_w
-            layer.height = need_h
+            # Through the setter, so content_version moves -- history shares
+            # buffers by version and would otherwise keep the pre-edit text.
+            layer.pixels = np.zeros((need_h, need_w, 4), dtype=np.float32)
         else:
+            layer.begin_write()
             layer._pixels[:] = 0.0
         # Paste rendered text
         ph, pw = min(rh, need_h), min(rw, need_w)

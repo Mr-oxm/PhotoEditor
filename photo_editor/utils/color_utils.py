@@ -71,3 +71,66 @@ def hsv_to_rgb(hsv: np.ndarray) -> np.ndarray:
 def luminance(rgb: np.ndarray) -> np.ndarray:
     """Rec.709 luminance."""
     return (0.2126 * rgb[..., 0] + 0.7152 * rgb[..., 1] + 0.0722 * rgb[..., 2]).astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# Planar variants
+# ---------------------------------------------------------------------------
+# These take and return contiguous ``(3, H, W)`` blocks. Indexing a plane is
+# then a contiguous view rather than a stride-3 gather, which is what makes
+# the HSL-based blend modes affordable. The maths is identical to the
+# interleaved functions above; only the layout and the sector selection
+# differ (boolean copyto instead of np.select, which evaluates and
+# materialises all six branches).
+
+def rgb_to_hsl_planar(rgb: np.ndarray) -> np.ndarray:
+    """(3, H, W) RGB [0,1] -> (3, H, W) HSL [0,1]."""
+    r, g, b = rgb[0], rgb[1], rgb[2]
+    mx = np.maximum(np.maximum(r, g), b)
+    mn = np.minimum(np.minimum(r, g), b)
+    l = (mx + mn) * 0.5
+    d = mx - mn
+    pos = d > 0
+    s = np.where(pos,
+                 np.where(l > 0.5, d / (2 - mx - mn + 1e-10),
+                          d / (mx + mn + 1e-10)),
+                 0)
+    safe = np.where(pos, d, 1)
+    h = np.zeros_like(l)
+    h = np.where((mx == r) & pos, ((g - b) / safe) % 6, h)
+    h = np.where((mx == g) & pos, (b - r) / safe + 2, h)
+    h = np.where((mx == b) & pos, (r - g) / safe + 4, h)
+    h /= 6.0
+    out = np.empty_like(rgb)
+    out[0], out[1], out[2] = h, s, l
+    return out
+
+
+def hsl_to_rgb_planar(hsl: np.ndarray) -> np.ndarray:
+    """(3, H, W) HSL [0,1] -> (3, H, W) RGB [0,1]."""
+    h, s, l = hsl[0], hsl[1], hsl[2]
+    c = (1 - np.abs(2 * l - 1)) * s
+    x = c * (1 - np.abs((h * 6) % 2 - 1))
+    m = l - c * 0.5
+    h6 = (h * 6).astype(np.int32) % 6
+
+    out = np.zeros_like(hsl)
+    r, g, b = out[0], out[1], out[2]
+    # Sector -> (r, g, b) source among {c, x, 0}, matching the np.select
+    # tables in hsl_to_rgb exactly.
+    for sector, (rs, gs, bs) in enumerate((
+        (c, x, None), (x, c, None), (None, c, x),
+        (None, x, c), (x, None, c), (c, None, x),
+    )):
+        sel = h6 == sector
+        if not sel.any():
+            continue
+        if rs is not None:
+            np.copyto(r, rs, where=sel)
+        if gs is not None:
+            np.copyto(g, gs, where=sel)
+        if bs is not None:
+            np.copyto(b, bs, where=sel)
+    out += m
+    np.clip(out, 0, 1, out=out)
+    return out

@@ -90,13 +90,13 @@ class TransformController(ControllerBase):
             return
 
         if self.doc.selection.active and self.doc.selection._mask is not None:
-            import numpy as np
-            mask = self.doc.selection._mask
-            rows = np.any(mask > 0.5, axis=1)
-            cols = np.any(mask > 0.5, axis=0)
-            if np.any(rows) and np.any(cols):
-                y0, y1 = int(np.where(rows)[0][0]), int(np.where(rows)[0][-1])
-                x0, x1 = int(np.where(cols)[0][0]), int(np.where(cols)[0][-1])
+            # Selection.bounds is cached per selection version. This used to
+            # run two full-document reductions plus two np.where scans on
+            # every rendered frame -- four passes over 8.3 M elements at 4K,
+            # thirty times a second, for an answer that rarely changes.
+            bounds = self.doc.selection.bounds
+            if bounds is not None:
+                x0, y0, x1, y1 = bounds
                 tool = mw._tools.active_tool
                 fdx = fdy = 0
                 if tool is not None and getattr(tool, '_floating', False):

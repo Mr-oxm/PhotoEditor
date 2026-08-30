@@ -22,7 +22,10 @@ def resize_image(document, new_width: int, new_height: int, resize_fn: Callable)
         layer_height, layer_width = pixels.shape[:2]
         next_width = max(1, round(layer_width * scale_x))
         next_height = max(1, round(layer_height * scale_y))
-        layer._pixels = resize_fn(pixels, (next_width, next_height))
+        # Assign through the property so content_version moves: history
+        # shares buffers by version, so a silent swap makes the next
+        # snapshot store the pre-resize pixels.
+        layer.pixels = resize_fn(pixels, (next_width, next_height))
         layer.width, layer.height = next_width, next_height
         offset_x, offset_y = layer.position
         layer.position = (round(offset_x * scale_x), round(offset_y * scale_y))

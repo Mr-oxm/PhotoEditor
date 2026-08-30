@@ -29,6 +29,7 @@ class MaskManager:
     def apply_mask(layer: Layer) -> None:
         """Burn the mask into the alpha channel permanently."""
         if layer.mask is not None:
+            layer.begin_write()
             layer.pixels[..., 3] *= layer.mask
             layer.remove_mask()
 
@@ -100,12 +101,14 @@ class MaskManager:
     def invert_mask_layer(layer: Layer) -> None:
         """Invert a MASK layer's pixel data (white ↔ black)."""
         if layer.layer_type == LayerType.MASK:
+            layer.begin_write()
             layer._pixels[..., :3] = 1.0 - layer._pixels[..., :3]
 
     @staticmethod
     def fill_mask_layer(layer: Layer, value: float = 1.0) -> None:
         """Fill a MASK layer with a uniform gray value."""
         if layer.layer_type == LayerType.MASK:
+            layer.begin_write()
             layer._pixels[..., :3] = value
             layer._pixels[..., 3] = 1.0
 

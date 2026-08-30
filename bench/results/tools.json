@@ -1,0 +1,64 @@
+{
+  "name": "tools",
+  "env": {
+    "python": "3.13.15",
+    "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+    "machine": "arm64",
+    "cpu_count": 14,
+    "numpy": "2.4.2",
+    "opencv": "4.13.0",
+    "cv2_threads": 14,
+    "pyside6": "6.10.2"
+  },
+  "results": [
+    {
+      "name": "brush_move_sel0",
+      "iterations": 30,
+      "best_ms": 0.041,
+      "median_ms": 0.043,
+      "mean_ms": 0.048,
+      "fps": 23300.79,
+      "tool": "brush",
+      "selection": false
+    },
+    {
+      "name": "brush_move_sel1",
+      "iterations": 30,
+      "best_ms": 0.044,
+      "median_ms": 0.046,
+      "mean_ms": 0.061,
+      "fps": 21621.38,
+      "tool": "brush",
+      "selection": true
+    },
+    {
+      "name": "eraser_move_sel0",
+      "iterations": 30,
+      "best_ms": 0.05,
+      "median_ms": 0.056,
+      "mean_ms": 0.062,
+      "fps": 17977.69,
+      "tool": "eraser",
+      "selection": false
+    },
+    {
+      "name": "eraser_move_sel1",
+      "iterations": 30,
+      "best_ms": 0.051,
+      "median_ms": 0.052,
+      "mean_ms": 0.057,
+      "fps": 19192.2,
+      "tool": "eraser",
+      "selection": true
+    },
+    {
+      "name": "transform_move",
+      "iterations": 10,
+      "best_ms": 31.184,
+      "median_ms": 33.532,
+      "mean_ms": 34.118,
+      "fps": 29.82,
+      "tool": "transform"
+    }
+  ]
+}

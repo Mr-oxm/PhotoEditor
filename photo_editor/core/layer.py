@@ -14,6 +14,7 @@ the source.
 
 from __future__ import annotations
 
+import itertools
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, TypeAlias
 from uuid import uuid4
@@ -28,6 +29,11 @@ if TYPE_CHECKING:
     LayerProcessor: TypeAlias = ImageProcessor
 else:
     LayerProcessor = object
+
+
+# Never reused, so a version value identifies content globally and for the
+# life of the process.
+_CONTENT_VERSION = itertools.count(1)
 
 
 @dataclass
@@ -61,6 +67,18 @@ class Layer:
     transform_base_h: int = 0
 
     def __post_init__(self) -> None:
+        # Process-wide monotonic, NOT per-layer. Restoring an undo state
+        # rebuilds Layer objects from scratch, so a per-layer counter
+        # restarted at 1 and a later snapshot could collide with a stale
+        # (id, version) pair and share the discarded branch's pixels.
+        # The render pipeline's layer cache keys off this, so any code path
+        # that mutates pixels in place must call touch().
+        self._content_version: int = next(_CONTENT_VERSION)
+        # Copy-on-write: set when the undo history holds a reference to this
+        # layer's buffers. While frozen the arrays are marked non-writeable,
+        # so an in-place edit that forgot begin_write() raises immediately
+        # instead of silently corrupting a stored history state.
+        self._frozen: bool = False
         self._pixels = np.zeros((self.height, self.width, 4), dtype=np.float32)
         self._mask: np.ndarray | None = None
         self._styles: list = []
@@ -95,6 +113,66 @@ class Layer:
     def pixels(self, value: np.ndarray) -> None:
         self._pixels = value.astype(np.float32) if value.dtype != np.float32 else value
         self.height, self.width = value.shape[:2]
+        self._frozen = False
+        self._content_version = next(_CONTENT_VERSION)
+
+    # ---- Content versioning -------------------------------------------------
+
+    @property
+    def content_version(self) -> int:
+        """Bumped on every content change; the render cache keys off it."""
+        return self._content_version
+
+    def touch(self) -> None:
+        """Signal that pixel or mask data was mutated in place.
+
+        Painting tools write directly into ``layer.pixels[y0:y1, x0:x1]``,
+        which the property setter never sees. They must call this so cached
+        renders of the layer are dropped.
+        """
+        self._content_version = next(_CONTENT_VERSION)
+
+    def begin_write(self) -> None:
+        """Take private ownership of the pixel buffers before editing.
+
+        Undo snapshots reference a layer's arrays rather than copying them,
+        which is what makes multi-layer undo affordable. This un-shares them
+        again on the first write after a snapshot, so history keeps the old
+        content and the layer gets a buffer it may mutate.
+
+        Every in-place edit must call this *before* writing. Frozen buffers
+        are non-writeable, so a missed call fails loudly and immediately.
+        """
+        if self._frozen:
+            self._pixels = self._pixels.copy()
+            if self._mask is not None and not self._mask.flags.writeable:
+                self._mask = self._mask.copy()
+            if self._source_pixels is not None and not self._source_pixels.flags.writeable:
+                self._source_pixels = self._source_pixels.copy()
+            if self._source_mask is not None and not self._source_mask.flags.writeable:
+                self._source_mask = self._source_mask.copy()
+            self._frozen = False
+        self._content_version = next(_CONTENT_VERSION)
+
+    def freeze(self) -> None:
+        """Mark the buffers as shared with history and make them read-only."""
+        self._frozen = True
+        for arr in (self._pixels, self._mask,
+                    self._source_pixels, self._source_mask):
+            if arr is not None:
+                try:
+                    arr.flags.writeable = False
+                except ValueError:
+                    # A view whose base is already read-only, or an array
+                    # that does not own its data -- already effectively frozen.
+                    pass
+
+    def _adopt(self, pixels: np.ndarray, frozen: bool) -> None:
+        """Install *pixels* directly, optionally as a frozen shared buffer."""
+        self._pixels = pixels
+        self.height, self.width = pixels.shape[:2]
+        self._frozen = frozen
+        self._content_version = next(_CONTENT_VERSION)
 
     # ---- Non-destructive transform API --------------------------------------
 
@@ -138,6 +216,7 @@ class Layer:
             self._source_pixels = self._pixels.copy()
             if self._mask is not None:
                 self._source_mask = self._mask.copy()
+            self._content_version = next(_CONTENT_VERSION)
             # Ensure base dimensions are initialised
             if self.transform_base_w == 0:
                 self.transform_base_w = self.width
@@ -194,6 +273,7 @@ class Layer:
             self._mask = np.clip(mask_result, 0.0, 1.0)
         self.height, self.width = result.shape[:2]
         self._pixels_dirty = False
+        self._content_version = next(_CONTENT_VERSION)
 
     def invalidate_transform(self) -> None:
         """Mark display pixels as needing lazy recompute from source."""
@@ -236,13 +316,16 @@ class Layer:
     @mask.setter
     def mask(self, value: np.ndarray | None) -> None:
         self._mask = value
+        self._content_version = next(_CONTENT_VERSION)
 
     def add_mask(self, fill_white: bool = True) -> None:
         val = 1.0 if fill_white else 0.0
         self._mask = np.full((self.height, self.width), val, dtype=np.float32)
+        self._content_version = next(_CONTENT_VERSION)
 
     def remove_mask(self) -> None:
         self._mask = None
+        self._content_version = next(_CONTENT_VERSION)
 
     # ---- Styles / Adjustments ----------------------------------------------
 
@@ -328,3 +411,4 @@ class Layer:
 
     def fill(self, color: np.ndarray) -> None:
         self._pixels[:] = color.astype(np.float32)
+        self._content_version = next(_CONTENT_VERSION)

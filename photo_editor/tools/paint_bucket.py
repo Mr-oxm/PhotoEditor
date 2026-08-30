@@ -80,6 +80,7 @@ class PaintBucketTool(Tool):
         if sel_mask is not None:
             mask *= sel_mask
         mask = mask[..., np.newaxis] * self.opacity
+        layer.begin_write()
         layer.pixels[:] = layer.pixels * (1 - mask) + self.color * mask
         np.clip(layer.pixels, 0, 1, out=layer.pixels)
 

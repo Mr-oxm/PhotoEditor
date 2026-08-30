@@ -131,6 +131,7 @@ class BrushTool(Tool):
         layer = doc.layers.active_layer
         if layer is None or layer.locked:
             return
+        layer.begin_write()
         lx, ly = layer.position
         radius = self._effective_radius(pressure)
         eff_opacity = self._effective_opacity(pressure)
@@ -160,12 +161,14 @@ class BrushTool(Tool):
     # Tool interface
     # ------------------------------------------------------------------
 
+
     def on_press(self, doc: Document, x: int, y: int, pressure: float = 1.0) -> None:
         self._rasterize_if_needed(doc)
         doc.save_snapshot("Brush Stroke")
         self._drawing = True
         self._last_x, self._last_y = x, y
         # Initial dab at the press point
+        self._begin_stroke_mask(doc)
         self._stamp_along(doc, x, y, x, y, pressure)
 
     def on_move(self, doc: Document, x: int, y: int, pressure: float = 1.0) -> None:
@@ -176,3 +179,4 @@ class BrushTool(Tool):
 
     def on_release(self, doc: Document, x: int, y: int) -> None:
         self._drawing = False
+        self._end_stroke_mask()

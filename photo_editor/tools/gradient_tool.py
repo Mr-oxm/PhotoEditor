@@ -202,6 +202,7 @@ class GradientTool(Tool):
             self._start_x - lx, self._start_y - ly,
             self._end_x - lx, self._end_y - ly,
         )
+        layer.begin_write()
         layer.pixels[:] = self._apply_gradient(self._saved_pixels, grad)
         self._emit_handles(True)
         if self._preview_cb:
@@ -284,6 +285,7 @@ class GradientTool(Tool):
             x - lx, y - ly,
             downsample=True,
         )
+        layer.begin_write()
         layer.pixels[:] = self._apply_gradient(self._saved_pixels, grad)
         self._emit_handles(True)
         if self._preview_cb:
@@ -305,6 +307,7 @@ class GradientTool(Tool):
 
         # No actual drag — cancel
         if self._start_x == x and self._start_y == y:
+            layer.begin_write()
             layer.pixels[:] = self._saved_pixels
             self._saved_pixels = None
             self._target_layer = None
@@ -319,6 +322,7 @@ class GradientTool(Tool):
             self._start_x - lx, self._start_y - ly,
             x - lx, y - ly,
         )
+        layer.begin_write()
         layer.pixels[:] = self._apply_gradient(self._saved_pixels, grad)
 
         # Keep saved state for handle editing

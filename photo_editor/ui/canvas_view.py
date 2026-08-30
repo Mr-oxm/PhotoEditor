@@ -9,20 +9,29 @@ transparently.
 from __future__ import annotations
 
 import math
+import os
 
+import cv2
 import numpy as np
 from PySide6.QtCore import Qt, QPointF, QRectF, QTimer, Signal
 from PySide6.QtGui import (
     QColor, QCursor, QImage, QKeyEvent, QMouseEvent,
-    QPainter, QPainterPath, QPen, QPixmap, QWheelEvent,
+    QPainter, QPainterPath, QPen, QPixmap, QPolygonF, QWheelEvent,
 )
 from PySide6.QtWidgets import QApplication, QWidget
 
-try:
-    from PySide6.QtOpenGLWidgets import QOpenGLWidget
-    _BASE_CLASS = QOpenGLWidget
-except ImportError:
+# The canvas is a QOpenGLWidget so QPainter work is GPU-accelerated. Set
+# BASERA_DISABLE_GL=1 to fall back to the software widget -- needed for
+# headless capture (Qt's offscreen platform cannot create a GL context) and
+# useful as an escape hatch on machines with broken GL drivers.
+if os.environ.get("BASERA_DISABLE_GL"):
     _BASE_CLASS = QWidget
+else:
+    try:
+        from PySide6.QtOpenGLWidgets import QOpenGLWidget
+        _BASE_CLASS = QOpenGLWidget
+    except ImportError:
+        _BASE_CLASS = QWidget
 
 from ..core.enums import ToolType
 from .canvas.canvas_cursors import (
@@ -73,6 +82,7 @@ class CanvasView(_BASE_CLASS):
         # Selection overlay — marching ants
         self._sel_mask: np.ndarray | None = None
         self._sel_contours: list | None = None  # list of QPolygonF for marching ants
+        self._sel_version: int | None = None    # content id of _sel_contours
         self._march_offset: int = 0               # animated dash offset
         self._march_timer = QTimer(self)
         self._march_timer.setInterval(100)         # ~10 fps animation
@@ -93,6 +103,8 @@ class CanvasView(_BASE_CLASS):
         self._dab_is_eraser: bool = False
         # Cache identity of last rgba buffer to skip redundant QPixmap builds
         self._last_rgba: np.ndarray | None = None
+        # Document-space rect the current frame covers (None = whole document).
+        self._src_rect: tuple[int, int, int, int] | None = None
 
         # Text editing overlay state
         self._text_cursor_pos: tuple[int, int] | None = None   # (x, y) in doc coords
@@ -125,7 +137,11 @@ class CanvasView(_BASE_CLASS):
         self._alt_held: bool = False                         # Alt modifier is held
 
         # Crop bounding box overlay state
-        self._crop_box: tuple[int, int, int, int] | None = None  # (x, y, w, h) doc coords
+        self._crop_box: tuple[int, int, int, int] | None = None
+
+        # Smart-snapping alignment lines (document coords), shown only while
+        # a drag is actually snapped to something.
+        self._snap_lines: list = []  # (x, y, w, h) doc coords
 
         # Guide lines (list of guide objects with .orientation and .position)
         self._guide_lines: list = []
@@ -155,35 +171,91 @@ class CanvasView(_BASE_CLASS):
 
     # ---- Public API ---------------------------------------------------------
 
-    def set_image(self, rgba: np.ndarray, force: bool = False) -> None:
+    def visible_doc_rect(self, margin: float = 0.15) -> tuple[int, int, int, int] | None:
+        """Document-space rectangle currently on screen, plus a margin.
+
+        Returns None when the whole document is visible, so the renderer
+        can skip ROI bookkeeping entirely. The margin gives the next frame
+        a little slack during a pan, so small movements do not immediately
+        expose un-rendered edges.
+        """
+        if not self._doc_w or not self._doc_h or self._zoom <= 0:
+            return None
+        dr = self._doc_rect()
+        if (dr.left() >= 0 and dr.top() >= 0
+                and dr.right() <= self.width() and dr.bottom() <= self.height()):
+            return None                      # entire document fits on screen
+        # Widget rect -> document coords
+        x0 = (0 - dr.left()) / self._zoom
+        y0 = (0 - dr.top()) / self._zoom
+        x1 = (self.width() - dr.left()) / self._zoom
+        y1 = (self.height() - dr.top()) / self._zoom
+        mx = (x1 - x0) * margin
+        my = (y1 - y0) * margin
+        x0 = max(0, int(x0 - mx))
+        y0 = max(0, int(y0 - my))
+        x1 = min(self._doc_w, int(x1 + mx) + 1)
+        y1 = min(self._doc_h, int(y1 + my) + 1)
+        if x1 <= x0 or y1 <= y0:
+            return None
+        if x0 == 0 and y0 == 0 and x1 >= self._doc_w and y1 >= self._doc_h:
+            return None
+        return (x0, y0, x1 - x0, y1 - y0)
+
+    def set_image(self, rgba: np.ndarray, force: bool = False,
+                  doc_size: tuple[int, int] | None = None,
+                  src_rect: tuple[int, int, int, int] | None = None) -> None:
+        """Display a composited frame.
+
+        *doc_size* is the document's logical size in document pixels. The
+        frame itself may be a lower-resolution preview, and everything that
+        maps between document and widget coordinates -- selection contours,
+        transform boxes, guides, rulers, tool hit-testing -- works in
+        document space. Deriving the document size from the buffer instead
+        would silently rescale all of it whenever the preview level changed.
+        """
         # Skip redundant QPixmap creation when the buffer is identical
-        if not force and rgba is self._last_rgba:
+        if not force and rgba is self._last_rgba and src_rect == self._src_rect:
             return
         self._last_rgba = rgba
+        self._src_rect = src_rect
         h, w = rgba.shape[:2]
-        self._doc_w, self._doc_h = w, h
+        if doc_size is not None:
+            self._doc_w, self._doc_h = doc_size
+        else:
+            self._doc_w, self._doc_h = w, h
         # Use the buffer directly without .copy() — QPixmap.fromImage
         # copies the data internally so we don't need a second copy.
         qimg = QImage(rgba.data, w, h, w * 4, QImage.Format.Format_RGBA8888)
         self._pixmap = QPixmap.fromImage(qimg)
         self.update()
 
-    def set_selection_mask(self, mask: np.ndarray | None) -> None:
-        """Set the selection mask for marching-ants overlay rendering."""
+    def set_selection_mask(self, mask: np.ndarray | None,
+                           version: int | None = None) -> None:
+        """Set the selection mask for marching-ants overlay rendering.
+
+        *version* identifies the selection's content. When it is unchanged
+        the contours are reused: tracing them costs a full-document uint8
+        conversion, a cv2.findContours pass and one Python-level QPointF per
+        contour point, and it was being redone on every rendered frame.
+        """
         if mask is None:
             if self._sel_mask is None:
                 return  # already cleared
             self._sel_mask = None
             self._sel_contours = None
+            self._sel_version = None
             self._march_timer.stop()
             self.update()
             return
+        if version is not None and version == self._sel_version:
+            return  # unchanged since the contours were built
+        self._sel_version = version
         self._sel_mask = mask
         # Extract contours from the binary mask for marching ants
-        import cv2
         mask_u8 = (np.clip(mask, 0, 1) * 255).astype(np.uint8)
-        contours, _ = cv2.findContours(mask_u8, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-        from PySide6.QtGui import QPolygonF
+        contours, _ = cv2.findContours(mask_u8, cv2.RETR_LIST,
+                                       cv2.CHAIN_APPROX_SIMPLE)
         polys = []
         for c in contours:
             if len(c) < 2:
@@ -233,6 +305,13 @@ class CanvasView(_BASE_CLASS):
     def set_crop_box(self, box: tuple[int, int, int, int] | None) -> None:
         """Set / clear the crop bounding box overlay (doc coords: x, y, w, h)."""
         self._crop_box = box
+        self.update()
+
+    def set_snap_lines(self, lines: list) -> None:
+        """Set the alignment lines to draw during a snapped drag."""
+        if not lines and not self._snap_lines:
+            return
+        self._snap_lines = list(lines)
         self.update()
 
     def set_guides(self, guides: list) -> None:
@@ -509,8 +588,17 @@ class CanvasView(_BASE_CLASS):
         p.drawTiledPixmap(dr.toAlignedRect(), checker_tile())
         p.restore()
 
-        # Document image
-        p.drawPixmap(dr.toAlignedRect(), self._pixmap)
+        # Document image. A partial frame (viewport ROI) covers only part
+        # of the document, so it is drawn into the matching sub-rectangle.
+        if self._src_rect is None:
+            p.drawPixmap(dr.toAlignedRect(), self._pixmap)
+        else:
+            sx, sy, sw, sh = self._src_rect
+            fx = dr.width() / self._doc_w if self._doc_w else 1.0
+            fy = dr.height() / self._doc_h if self._doc_h else 1.0
+            target = QRectF(dr.left() + sx * fx, dr.top() + sy * fy,
+                            sw * fx, sh * fy)
+            p.drawPixmap(target.toAlignedRect(), self._pixmap)
 
         # Selection overlay — marching ants
         if self._sel_contours:
@@ -598,6 +686,10 @@ class CanvasView(_BASE_CLASS):
         # Guide lines overlay (including preview guide)
         if self._guide_lines or self._preview_guide is not None:
             self._overlays.draw_guides(p, dr)
+
+        # Smart-snapping alignment lines
+        if self._snap_lines:
+            self._overlays.draw_snap_lines(p, dr)
 
         # Vector object overlay (node handles, path outlines)
         if self._current_tool_type in (ToolType.PEN, ToolType.NODE, ToolType.VECTOR_SHAPE, ToolType.MOVE):

@@ -130,6 +130,9 @@ class CloneStampTool(Tool):
         layer = doc.layers.active_layer
         if layer is None or layer.locked:
             return
+        # Undo snapshots share this layer's buffer and mark it read-only, so
+        # take private ownership before stamping into it in place.
+        layer.begin_write()
         lx, ly = layer.position
         radius = self._effective_radius(pressure)
         step = max(1.0, radius * 2 * self.spacing)
@@ -142,6 +145,7 @@ class CloneStampTool(Tool):
     # Tool interface
     # ------------------------------------------------------------------
 
+
     def on_press(self, doc: Document, x: int, y: int, pressure: float = 1.0) -> None:
         if not self.source_set:
             return
@@ -153,6 +157,7 @@ class CloneStampTool(Tool):
             self._offset_locked = True
         self._drawing = True
         self._last_x, self._last_y = x, y
+        self._begin_stroke_mask(doc)
         self._stamp_along(doc, x, y, x, y, pressure)
 
     def on_move(self, doc: Document, x: int, y: int, pressure: float = 1.0) -> None:
@@ -163,3 +168,4 @@ class CloneStampTool(Tool):
 
     def on_release(self, doc: Document, x: int, y: int) -> None:
         self._drawing = False
+        self._end_stroke_mask()

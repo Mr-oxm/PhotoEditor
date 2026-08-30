@@ -69,9 +69,59 @@ class CanvasController(ControllerBase):
                 mw._canvas.set_source_offset((ox, oy))
             self.signals.clone_preview_requested.emit(x, y)
 
+    def _begin_interaction(self) -> None:
+        """Tell the pipeline which layer is being edited.
+
+        Everything below it is then composited once and reused for the rest
+        of the drag, so a frame costs a copy plus one blend instead of a
+        full walk of the stack.
+        """
+        mw = self._mw
+        doc = mw._doc
+        if doc is None:
+            return
+        active = doc.layers.active_layer
+        mw._pipeline.begin_interaction(active.id if active else None)
+
+    def _end_interaction(self) -> None:
+        self._mw._pipeline.end_interaction()
+
+    def _prime_snapping(self) -> None:
+        """Give the Move tool the view state its snapping needs.
+
+        The snap threshold is in screen pixels, so it depends on zoom; the
+        guides are view state held by the window. Holding a modifier
+        suspends snapping for the duration of a drag, which is the usual
+        convention for nudging something into a position that is *near* an
+        alignment without taking it.
+        """
+        from PySide6.QtWidgets import QApplication
+        from PySide6.QtCore import Qt
+
+        mw = self.mw
+        tool = mw._tools.active_tool
+        engine = getattr(tool, "snap_engine", None)
+        if engine is None:
+            return
+        mods = QApplication.keyboardModifiers()
+        # Alt already sets the clone/heal source, so snapping is suspended
+        # with Ctrl (Cmd on macOS) -- the usual convention for placing
+        # something *near* an alignment without being taken to it.
+        suppressed = bool(mods & Qt.KeyboardModifier.ControlModifier)
+        engine.enabled = getattr(mw, "_snap_enabled", True) and not suppressed
+        tool.snap_zoom = mw._canvas.zoom
+        tool.snap_guides = getattr(mw, "_guides", None)
+
+    def _sync_snap_lines(self) -> None:
+        """Mirror the Move tool's snap lines onto the canvas overlay."""
+        tool = self._mw._tools.active_tool
+        self._mw._canvas.set_snap_lines(getattr(tool, "snap_lines", []) or [])
+
     def on_press(self, x: int, y: int, pressure: float) -> None:
         mw = self._mw
         self._dragging = True
+        self._prime_snapping()
+        self._begin_interaction()
 
         modifiers = QApplication.keyboardModifiers()
         if modifiers & Qt.KeyboardModifier.AltModifier:
@@ -170,7 +220,7 @@ class CanvasController(ControllerBase):
             dy1 = dy0 + (sy1 - sy0)
             if sx1 > sx0 and sy1 > sy0:
                 new_mask[dy0:dy1, dx0:dx1] = orig[sy0:sy1, sx0:sx1]
-            mw._doc.selection._mask = new_mask
+            mw._doc.selection._set_mask(new_mask)
             self.signals.selection_overlay_requested.emit()
             self.signals.canvas_update_requested.emit()
             return
@@ -198,16 +248,22 @@ class CanvasController(ControllerBase):
                 mw._canvas.set_lasso_points(list(tool._points))
         elif tool_type in (ToolType.PEN, ToolType.NODE, ToolType.VECTOR_SHAPE):
             mw._canvas.update()
-            if self._dragging:
-                mw._schedule_render()
+            mw._schedule_render()
         elif tool_type == ToolType.TEXT:
             self.signals.text_overlay_requested.emit()
             if not self._dragging:
                 self.signals.text_hover_cursor_requested.emit(x, y)
         else:
+            # The Move tool lands here, and it is the tool that snaps -- the
+            # alignment lines were previously forwarded only from the vector
+            # branch, which has no snap engine, so they were never drawn.
+            if self._dragging:
+                self._sync_snap_lines()
             mw._schedule_render()
 
     def on_release(self, x: int, y: int) -> None:
+        self._mw._canvas.set_snap_lines([])
+        self._end_interaction()
         mw = self._mw
         self._dragging = False
         if self._sel_moving:

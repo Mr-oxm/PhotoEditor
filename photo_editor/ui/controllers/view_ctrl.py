@@ -6,6 +6,8 @@ from PySide6.QtCore import QPointF
 
 from .base import ControllerBase
 from ..services.guide_ui_state import apply_guides, apply_preview_guide
+from ..widgets.rulers import RULER_SIZE
+from ...core.enums import LayerType
 
 
 class ViewController(ControllerBase):
@@ -28,6 +30,10 @@ class ViewController(ControllerBase):
         a["toggle_grid"].triggered.connect(self.on_toggle_grid)
         a["toggle_rulers"].triggered.connect(self.on_toggle_rulers)
         a["toggle_guides"].triggered.connect(self.on_toggle_guides)
+        if "toggle_snapping" in a:
+            a["toggle_snapping"].setCheckable(True)
+            a["toggle_snapping"].setChecked(True)
+            a["toggle_snapping"].triggered.connect(self.on_toggle_snapping)
         
         from ..theme import THEMES
         for key in THEMES.keys():
@@ -111,6 +117,22 @@ class ViewController(ControllerBase):
         state = "on" if mw._rulers_visible else "off"
         self.ctx.show_status_message(f"Rulers {state}", 2000)
 
+    def on_toggle_snapping(self) -> None:
+        """Turn smart snapping on or off for the session.
+
+        Snapping can also be suspended for a single drag by holding Ctrl
+        (Cmd on macOS), which is the usual way to place something just
+        beside an alignment rather than on it.
+        """
+        mw = self.mw
+        mw._snap_enabled = not getattr(mw, "_snap_enabled", True)
+        action = mw._menu.actions_map.get("toggle_snapping")
+        if action is not None:
+            action.setChecked(mw._snap_enabled)
+        mw._canvas.set_snap_lines([])
+        state = "on" if mw._snap_enabled else "off"
+        mw._status.show_activity(f"Snap to objects {state}", 1500)
+
     def on_toggle_guides(self) -> None:
         mw = self.mw
         mw._show_guides = not getattr(mw, "_show_guides", True)
@@ -175,7 +197,6 @@ class ViewController(ControllerBase):
         v_origin = dr.top()
         mw._v_ruler.set_view_params(v_zoom, v_origin, dh)
 
-        from ..widgets.rulers import RULER_SIZE
         mw._h_ruler.set_perp_view_params(v_zoom, v_origin + RULER_SIZE, dh)
         mw._v_ruler.set_perp_view_params(h_zoom, h_origin + RULER_SIZE, dw)
 
@@ -186,11 +207,13 @@ class ViewController(ControllerBase):
             mw._h_ruler.set_unit(unit, dpi)
             mw._v_ruler.set_unit(unit, dpi)
 
-        from ...core.enums import LayerType
         layer = mw._doc.layers.active_layer if mw._doc else None
         if layer and layer.layer_type not in (LayerType.GROUP, LayerType.MASK):
             lx, ly = layer.position
-            lh, lw = layer.pixels.shape[:2]
+            # layer.width/height, not layer.pixels.shape: the pixels property
+            # triggers a full non-destructive-transform recompute when the
+            # layer is dirty, and this runs on the view-change path.
+            lw, lh = layer.width, layer.height
             mw._h_ruler.set_layer_bounds(float(lx), float(lx + lw))
             mw._v_ruler.set_layer_bounds(float(ly), float(ly + lh))
         else:

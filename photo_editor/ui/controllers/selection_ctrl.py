@@ -41,8 +41,12 @@ class SelectionController(ControllerBase):
         mw._props_panel.selection_action.connect(self.on_sel_action)
 
     def update_selection_overlay(self) -> None:
-        mask = self.doc.selection._mask if self.doc else None
-        apply_selection_overlay(self.mw._canvas, mask)
+        if not self.doc:
+            apply_selection_overlay(self.mw._canvas, None)
+            return
+        sel = self.doc.selection
+        apply_selection_overlay(self.mw._canvas, sel._mask,
+                                version=sel.version, is_empty=sel.is_empty)
 
     def extract_layer_mask(self, doc_mask, lx: int, ly: int, w: int, h: int):
         """Extract the portion of the doc-level selection mask that overlaps the layer."""
@@ -122,6 +126,7 @@ class SelectionController(ControllerBase):
         h, w = layer.pixels.shape[:2]
         layer_mask = self.extract_layer_mask(mask, lx, ly, w, h)
         if layer_mask is not None:
+            layer.begin_write()
             layer.pixels[..., 3] *= (1.0 - layer_mask)
         self.ctx.refresh()
 
@@ -147,12 +152,14 @@ class SelectionController(ControllerBase):
         if mask is not None:
             layer_mask = self.extract_layer_mask(mask, lx, ly, w, h)
             if layer_mask is not None:
+                layer.begin_write()
                 for c in range(4):
                     layer.pixels[..., c] = (
                         layer.pixels[..., c] * (1.0 - layer_mask)
                         + color[c] * layer_mask
                     )
         else:
+            layer.begin_write()
             layer.pixels[..., :] = color
         self.ctx.refresh()
 

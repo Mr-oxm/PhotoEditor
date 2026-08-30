@@ -148,6 +148,9 @@ class HealingBrushTool(Tool):
         layer = doc.layers.active_layer
         if layer is None or layer.locked:
             return
+        # Undo snapshots share this layer's buffer and mark it read-only, so
+        # take private ownership before healing into it in place.
+        layer.begin_write()
         lx, ly = layer.position
         radius = max(1, self.size // 2)
         step = max(1.0, radius * 0.5)
@@ -171,6 +174,7 @@ class HealingBrushTool(Tool):
             self._offset_locked = True
         self._drawing = True
         self._last_x, self._last_y = x, y
+        self._begin_stroke_mask(doc)
         self._heal_along(doc, x, y, x, y)
 
     def on_move(self, doc: Document, x: int, y: int, pressure: float = 1.0) -> None:
@@ -181,3 +185,4 @@ class HealingBrushTool(Tool):
 
     def on_release(self, doc: Document, x: int, y: int) -> None:
         self._drawing = False
+        self._end_stroke_mask()
