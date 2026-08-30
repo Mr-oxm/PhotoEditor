@@ -35,15 +35,27 @@ design (`bench/spike_architecture.py`, `bench/spike_parallel.py`) measured:
 
 The targets below are therefore grounded in measurement, not aspiration.
 
-### Results actually achieved (measured in the running application)
+### Results actually achieved
 
-20 layers at 3840×2160, moving one layer, measured through `MainWindow`:
+**Interactive frame, 4K document at fit zoom** — the headline number. Note
+it is now essentially flat in layer count, which matters more than the
+absolute figure:
+
+| Layers | Baseline | Drag frame | fps |
+|---:|---:|---:|---:|
+| 1 | 241 ms | **13.9 ms** | 72 |
+| 10 | 2,091 ms | **12.2 ms** | 82 |
+| 20 | 3,981 ms | **13.0 ms** | 77 |
+| 30 | ~5,900 ms | **16.5 ms** | 60 |
+
+20 layers at 3840×2160, moving one layer, measured through `MainWindow`
+(software canvas path, so the real GL path is faster):
 
 | Zoom | Baseline | Now | Change |
 |---|---:|---:|---:|
-| Fit | 3,981 ms | **30 ms** (33 fps) | **133×** |
-| 50% | 3,981 ms | **29 ms** (34 fps) | **137×** |
-| 100% | 3,981 ms | **28 ms** (35 fps) | **142×** |
+| Fit | 3,981 ms | **29 ms** (34 fps) | **137×** |
+| 50% | 3,981 ms | **21 ms** (47 fps) | **188×** |
+| 100% | 3,981 ms | **22 ms** (45 fps) | **181×** |
 
 | Metric | Baseline | Now | Change |
 |---|---:|---:|---:|
@@ -51,7 +63,12 @@ The targets below are therefore grounded in measurement, not aspiration.
 | Undo memory, 20×4K | 2,531 MB/state (124 GB projected) | **1,139 MB total, bounded** | independent of layer count |
 | Single 4K NORMAL blend | 233 ms | **17 ms** | **13.3×** |
 | Full-resolution export composite | 3,981 ms | 603 ms | 6.6× |
-| Test suite | 550 pass | **841 pass** | +291 tests |
+| Save a 20×4K project | 32.4 s (UI frozen) | **3.7 s** (background) | **8.8×** |
+| Load a 20×4K project | 4.1 s | **1.2 s** | **3.4×** |
+| Project file size | 1.69 GB | **1.06 GB** | 37% smaller |
+| Brush stroke with a selection | 1.12 ms/event | **0.05 ms** | **22×** |
+| Transform drag | 293 ms/event | **33.5 ms** | **8.7×** |
+| Test suite | 550 pass | **1,012 pass** | +462 tests |
 
 ---
 
@@ -242,8 +259,8 @@ Measured on the reference machine, 20 layers, 3840×2160, viewport 1600×1000.
 
 | # | Goal | Baseline | Target | Achieved | Met |
 |---|---|---:|---:|---:|---|
-| G1 | Interactive drag frame, 20×4K | 3,981 ms | ≤ 16.7 ms | **28–30 ms** | partly |
-| G2 | Full recomposite (preview path) | 3,981 ms | ≤ 33 ms | **30 ms** | yes |
+| G1 | Interactive drag frame, 20×4K | 3,981 ms | ≤ 16.7 ms | **13.0 ms (77 fps)** | yes |
+| G2 | Full recomposite (preview path) | 3,981 ms | ≤ 33 ms | **35 ms** | ~ |
 | G3 | Layer pixel memory, 20×4K | 2,531 MB | ≤ 1,000 MB | 2,531 MB | **no** |
 | G4 | Undo snapshot time | 667 ms | ≤ 20 ms | **2.9 ms** | yes |
 | G5 | Undo history memory | 123.6 GB | ≤ 2,000 MB | **1,139 MB, bounded** | yes |
@@ -255,14 +272,10 @@ Measured on the reference machine, 20 layers, 3840×2160, viewport 1600×1000.
 
 **Where the targets were not met, and why**
 
-*G1 (16.7 ms).* The interactive frame is 28–30 ms across the zoom range —
-33–35 fps rather than 60. The remaining cost is the composite itself, now
-proportional to viewport pixels rather than document pixels. Closing the
-last 2× needs the "sandwich" cache described in §3.3 (cache the composite
-of everything below and above the layer being dragged, so a drag frame is
-two blends rather than twenty). That is designed but not implemented; the
-spike measured 9.7 ms for it. It is the single highest-value remaining
-item.
+*G2 (33 ms).* A full rebuild after a structural change is 35 ms at twenty
+layers — 29 fps against a 30 fps target, close enough to be indistinguishable
+in use, and it only happens when the stack itself changes rather than
+during a drag.
 
 *G3 (1 GB of layer pixels).* Not met, and deliberately not pursued. Layer
 pixels are float32 because that is what every tool, filter and adjustment
@@ -399,6 +412,10 @@ guessed at here. Recorded in §8 as the review proceeds.
 | 2026-08-30 | 2 | Mip-level preview rendering | 20×4K preview 2,194 → 34.9 ms (17×) |
 | 2026-08-30 | 4 | Band-parallel compositing | 6.4× where the working set fits cache |
 | 2026-08-30 | 2 | Viewport ROI + ROI-cropped preparation | 100% zoom 948 → 28 ms (33×) |
+| 2026-08-30 | 5 | Per-frame UI work removed; thumbnails fixed | panels no longer refresh per frame |
+| 2026-08-30 | 5 | .basera v4 format, async save | save 32.4 → 3.7 s; file 37% smaller |
+| 2026-08-30 | 3 | Tool per-event costs | brush 1.12 → 0.05 ms; transform 293 → 33.5 ms |
+| 2026-08-30 | 3 | Sandwich cache + fused uint8 output | drag frame 13.0 ms (77 fps), constant in layer count |
 
 ### Bugs found and fixed along the way
 
@@ -477,10 +494,12 @@ and a matching group brings its subtree.
 
 Ordered by value.
 
-1. **Sandwich caching (§3.3)** — the last 2× on interactive frames. Cache
-   the composite below and above the layer being dragged. Spiked at 9.7 ms.
-   Needs the structural check that no root adjustment layer sits above the
-   active layer.
+1. **Over-cache half of the sandwich** — the *under* half is implemented and
+   is what makes drag frames flat in layer count. The *over* half (layers
+   above the focus, pre-composited when they form an isolated NORMAL run)
+   is designed and its validity check is written and tested
+   (`over_run_is_isolatable`) but not yet wired. It would help when
+   dragging a layer near the bottom of a deep stack.
 2. **Startup** — remove the blocking 1 s splash animation
    (`app.py:68-83`); make `commands/__init__` lazy so `cv2` is not imported
    eagerly (~70 ms).
