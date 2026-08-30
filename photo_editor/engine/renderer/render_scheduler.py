@@ -193,13 +193,17 @@ class RenderScheduler(QObject):
         drag, so older results are dropped rather than painted.
         """
         self._in_flight = False
-        # Learn the output shape from the first frame so subsequent frames
-        # get a scheduler-owned buffer of the right size. The frame itself is
-        # NOT adopted -- it may be the pipeline's internal buffer.
+        # Learn the output shape from the first frame so later frames get a
+        # scheduler-OWNED buffer of the right size. The frame itself is
+        # deliberately not adopted: it may be the pipeline's internal buffer,
+        # and putting that in both slots is how "double buffering" silently
+        # became one array that a worker could overwrite while the UI thread
+        # was still converting it to a QPixmap.
         if isinstance(rgba, np.ndarray) and rgba.dtype == np.uint8:
             shape = (rgba.shape[0], rgba.shape[1], rgba.shape[2])
-            self._buffer_shape = shape
-            self._buffers = [rgba, rgba]  # REGRESSION: both slots alias
+            if self._buffer_shape != shape:
+                self._buffer_shape = shape
+                self._buffers = [None, None]
         if generation_id >= self._last_shown_generation:
             self._last_shown_generation = generation_id
             self.render_ready.emit(rgba, generation_id, full_refresh,
