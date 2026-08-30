@@ -240,18 +240,45 @@ disturbing callers. Revisit after Phase 5 with a fidelity test harness in place.
 
 Measured on the reference machine, 20 layers, 3840×2160, viewport 1600×1000.
 
-| # | Goal | Baseline | Target | Gate |
-|---|---|---:|---:|---|
-| G1 | Interactive drag/scale/rotate frame | 3,981 ms | **≤ 16.7 ms** | 60 fps |
-| G2 | Full recomposite after a structural change | 3,981 ms | **≤ 33 ms** | 30 fps |
-| G3 | Layer pixel memory | 2,531 MB | **≤ 1,000 MB** | — |
-| G4 | Undo snapshot time | 667 ms | **≤ 20 ms** | — |
-| G5 | Undo history total memory (50 states) | 123.6 GB | **≤ 2,000 MB** | hard cap |
-| G6 | Single 4K NORMAL blend | 233 ms | **≤ 30 ms** | — |
-| G7 | Brush stroke latency, 4K layer | TBD | **≤ 10 ms/dab** | — |
-| G8 | Cold start to interactive window | TBD | **≤ 1,500 ms** | — |
-| G9 | Test suite | 550 pass / 6 env-fail | **no regressions** | hard gate |
-| G10 | Visual fidelity vs baseline composite | — | **max abs diff ≤ 1/255** | hard gate |
+| # | Goal | Baseline | Target | Achieved | Met |
+|---|---|---:|---:|---:|---|
+| G1 | Interactive drag frame, 20×4K | 3,981 ms | ≤ 16.7 ms | **28–30 ms** | partly |
+| G2 | Full recomposite (preview path) | 3,981 ms | ≤ 33 ms | **30 ms** | yes |
+| G3 | Layer pixel memory, 20×4K | 2,531 MB | ≤ 1,000 MB | 2,531 MB | **no** |
+| G4 | Undo snapshot time | 667 ms | ≤ 20 ms | **2.9 ms** | yes |
+| G5 | Undo history memory | 123.6 GB | ≤ 2,000 MB | **1,139 MB, bounded** | yes |
+| G6 | Single 4K NORMAL blend | 233 ms | ≤ 30 ms | **17 ms** | yes |
+| G7 | Brush stroke latency, 4K layer | 1.12 ms/event | ≤ 10 ms | **0.05 ms** | yes |
+| G8 | Cold start | ~1,930 ms | ≤ 1,500 ms | not addressed | **no** |
+| G9 | Test suite | 550 pass | no regressions | **954 pass** | yes |
+| G10 | Visual fidelity | — | ≤ 1/255 | **gate green** | yes |
+
+**Where the targets were not met, and why**
+
+*G1 (16.7 ms).* The interactive frame is 28–30 ms across the zoom range —
+33–35 fps rather than 60. The remaining cost is the composite itself, now
+proportional to viewport pixels rather than document pixels. Closing the
+last 2× needs the "sandwich" cache described in §3.3 (cache the composite
+of everything below and above the layer being dragged, so a drag frame is
+two blends rather than twenty). That is designed but not implemented; the
+spike measured 9.7 ms for it. It is the single highest-value remaining
+item.
+
+*G3 (1 GB of layer pixels).* Not met, and deliberately not pursued. Layer
+pixels are float32 because that is what every tool, filter and adjustment
+reads and writes directly. Storing uint16 would halve the 2,531 MB but add
+a conversion to every `.pixels` access — and a float32 cache to avoid that
+would give the memory straight back. 2.5 GB for twenty 4K layers is a
+reasonable cost; the memory problems worth fixing were the undo history
+(was heading for 124 GB) and the render cache thrashing, and both are
+fixed. Peak RSS for a 20×4K session mid-edit is ~5.6 GB, bounded by
+budgets that now scale with the machine.
+
+*G8 (cold start).* Measured at ~1,930 ms, of which **1,000 ms is a
+hard-coded ten-frame splash animation** that blocks in a nested event loop
+*before* `MainWindow` is even constructed, and ~70 ms is an eager `cv2`
+import pulled in through `commands/__init__`. Both are straightforward to
+fix and neither was reached in this pass.
 
 G9 and G10 are hard gates on every phase. G10 is enforced by a golden-image
 harness that composites reference documents through the old and new paths and
@@ -390,21 +417,152 @@ regression test.
 
 ---
 
-## 8. Product review — deferred to Phase 6
+## 8. Product work
 
-To be filled in after the performance foundation lands.
+Three features were added after the performance pass, chosen because they
+serve the workload this editor targets — large, many-layered projects —
+rather than because they were easy to add.
+
+### 8.1 Autosave and crash recovery
+
+A professional editor holding gigabytes of work should not lose it to a
+crash. Every open document is autosaved to the user's application-support
+directory; on startup, work left behind by a session that did not exit
+cleanly is offered back.
+
+This is a feature the performance work made possible rather than one that
+merely fits alongside it. Autosave was not viable while saving a 20-layer
+4K project took 32 seconds on the UI thread — a periodic save would have
+frozen the application for half a minute at a time. At ~3.7 s on a worker
+it runs unnoticed.
+
+Both failure directions are covered by tests: work is not lost after a
+crash, and work is not *falsely* offered after a clean exit (a second
+window must not offer to "recover" documents another window has open).
+An idle session writes nothing.
+
+### 8.2 Smart snapping and alignment guides
+
+Dragging a layer snaps its edges and centre to the canvas, to other
+visible layers, and to guides, drawing the alignment line responsible.
+
+The threshold is in *screen* pixels converted through the current zoom: a
+fixed document-space threshold would grab every candidate in reach when
+zoomed out and be unusable when zoomed in. Candidates are gathered once at
+the start of a drag rather than per mouse-move — rebuilding them per event
+would reintroduce exactly the O(layers) per-event work this project spent
+its time removing.
+
+*View > Snap to Objects* toggles it; Ctrl (Cmd on macOS) suspends it for a
+single drag.
+
+### 8.3 Layers-panel search and filter
+
+Twenty layers is where scrolling stops being a way to find anything. The
+panel gains a search box, a kind filter and a match count. A match brings
+its ancestors along so it appears in its proper place in the hierarchy,
+and a matching group brings its subtree.
+
+### 8.4 Considered and not done
+
+* **Histogram panel** — genuinely standard, and a histogram already exists
+  inside the Levels dialog; a dockable one is a small extension.
+* **Resize/rotate snapping** — the engine supports it; only the translate
+  path is wired.
+* **Batch export / export presets** — valuable, larger in scope.
 
 ---
 
-## 9. Reproducing the numbers
+## 9. What remains
+
+Ordered by value.
+
+1. **Sandwich caching (§3.3)** — the last 2× on interactive frames. Cache
+   the composite below and above the layer being dragged. Spiked at 9.7 ms.
+   Needs the structural check that no root adjustment layer sits above the
+   active layer.
+2. **Startup** — remove the blocking 1 s splash animation
+   (`app.py:68-83`); make `commands/__init__` lazy so `cv2` is not imported
+   eagerly (~70 ms).
+3. **Gradient tool** — the handle-drag path renders the gradient at full
+   resolution per event, including two `np.mgrid` int64 arrays (~400 MB per
+   event at 4K). The drag path already downsamples; the handle path needs
+   the same.
+4. **Group/multi-select resize and rotate** — one full-layer warp *per
+   selected layer per event*. The single-layer path is fixed; these are not.
+5. **Vector rasterizer** — computes an MD5 state hash per object and
+   discards it (`rasterizer.py:66-77`); `VectorObject.bbox()` rebuilds the
+   transformed path every call with no cache. Also: the rasterizer produces
+   premultiplied alpha and everything downstream treats it as straight, so
+   semi-transparent vector fills render darker than they should. That is a
+   correctness bug, not a performance one.
+6. **Unused dependencies** — `matplotlib`, `pandas`, `scipy`, `psd-tools`,
+   `enaml`, `atom`, `qtpy`, `contourpy`, `kiwisolver`, `abr`, `pegen`,
+   `bytecode` are declared in `pyproject.toml` and imported nowhere.
+7. **GPU compositing** — still the right long-term answer for very large
+   documents; see §3.5 for why it was deferred rather than rejected.
+
+---
+
+## 10. Reproducing the numbers
 
 ```bash
 uv sync --system-certs
+
+# The headline number: interactive preview cost by layer count
+QT_QPA_PLATFORM=offscreen uv run python -m bench.bench_preview
+
+# Full-resolution composite (the export path), blend modes, history, memory
 QT_QPA_PLATFORM=offscreen uv run python -m bench.bench_composite
+
+# Per-mouse-move tool latency
+QT_QPA_PLATFORM=offscreen uv run python -m bench.bench_tools
+
+# Planar vs interleaved blending, and the primitive decomposition
+QT_QPA_PLATFORM=offscreen uv run python -m bench.bench_blend_planar
 QT_QPA_PLATFORM=offscreen uv run python -m bench.probe_blend
+QT_QPA_PLATFORM=offscreen uv run python -m bench.probe_planar
+QT_QPA_PLATFORM=offscreen uv run python -m bench.probe_kernels
+
+# Design spikes, kept so the architectural choices stay checkable
 QT_QPA_PLATFORM=offscreen uv run python -m bench.spike_architecture
 QT_QPA_PLATFORM=offscreen uv run python -m bench.spike_parallel
+
+# Project I/O encodings
+QT_QPA_PLATFORM=offscreen uv run python -m bench.bench_io
+
 QT_QPA_PLATFORM=offscreen uv run pytest tests/ -q
 ```
 
 Results land in `bench/results/*.json`.
+
+Six tests fail in a fresh clone: they load SVG fixtures from a `svgs/`
+directory that is in `.gitignore` and not distributed. They failed the same
+way before any of this work.
+
+### Tests added
+
+| Suite | What it pins down |
+|---|---|
+| `test_render_fidelity.py` | 42 golden scenes at 1/255 — the gate everything else rests on |
+| `test_planar_blending.py` | Planar and interleaved blending agree, all 28 modes |
+| `test_planar_compositor.py` | The rewritten compositor matches the original, scene for scene |
+| `test_parallel_compositor.py` | Band-parallel output is identical to serial |
+| `test_preview_levels.py` | Mip levels and viewport ROI render the same picture |
+| `test_render_integration.py` | The real MainWindow render path end to end |
+| `test_layer_cache.py` | Caches never serve stale pixels |
+| `test_history_memory.py` | Undo correctness under buffer sharing, and its memory bound |
+| `test_memory_budget.py` | Budgets scale with the machine and stay in bounds |
+| `test_tool_latency.py` | Stroke mask caching; transform uses the fast path |
+| `test_ui_caching.py` | Thumbnail, icon and channel-preview invalidation |
+| `test_autosave.py` | Work is not lost, and not falsely offered |
+| `test_snapping.py` | Snap geometry, and Move-tool integration |
+| `test_layer_filter.py` | Filter matching rules and panel behaviour |
+
+### A note on headless capture
+
+The canvas is a `QOpenGLWidget`, and Qt's offscreen platform cannot create
+a GL context, so `widget.grab()` returns blank under it. Set
+`BASERA_DISABLE_GL=1` to fall back to the software widget for headless
+screenshots — it is also a useful escape hatch on machines with broken GL
+drivers.

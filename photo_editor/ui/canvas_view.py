@@ -9,6 +9,7 @@ transparently.
 from __future__ import annotations
 
 import math
+import os
 
 import cv2
 import numpy as np
@@ -19,11 +20,18 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import QApplication, QWidget
 
-try:
-    from PySide6.QtOpenGLWidgets import QOpenGLWidget
-    _BASE_CLASS = QOpenGLWidget
-except ImportError:
+# The canvas is a QOpenGLWidget so QPainter work is GPU-accelerated. Set
+# BASERA_DISABLE_GL=1 to fall back to the software widget -- needed for
+# headless capture (Qt's offscreen platform cannot create a GL context) and
+# useful as an escape hatch on machines with broken GL drivers.
+if os.environ.get("BASERA_DISABLE_GL"):
     _BASE_CLASS = QWidget
+else:
+    try:
+        from PySide6.QtOpenGLWidgets import QOpenGLWidget
+        _BASE_CLASS = QOpenGLWidget
+    except ImportError:
+        _BASE_CLASS = QWidget
 
 from ..core.enums import ToolType
 from .canvas.canvas_cursors import (
