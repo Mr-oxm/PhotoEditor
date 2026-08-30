@@ -40,3 +40,17 @@ def test_determinism():
     a = render_scene(factory())
     b = render_scene(factory())
     np.testing.assert_array_equal(a, b)
+
+
+def test_composite_output_is_never_negative():
+    """The uint8 conversion uses cv2.convertScaleAbs, which takes an
+    absolute value. That is only safe because the compositor cannot emit a
+    negative: blend results are clamped to [0, 1] and Porter-Duff 'over'
+    preserves non-negativity. If that ever stops being true, this fails
+    before anyone sees a black pixel turn light."""
+    from photo_editor.engine.planar_compositor import PlanarCompositor
+    for name, factory in all_scenes().items():
+        doc = factory()
+        out = PlanarCompositor().composite(doc.layers, doc.width, doc.height)
+        assert float(out.min()) >= 0.0, f"{name} produced a negative value"
+        assert float(out.max()) <= 1.0 + 1e-6, f"{name} exceeded 1.0"

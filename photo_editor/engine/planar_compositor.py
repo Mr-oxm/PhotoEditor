@@ -45,9 +45,16 @@ def _round_half_up(value: float) -> int:
 class PlanarCompositor:
     """Composites a LayerStack into a flat planar RGBA buffer."""
 
-    def __init__(self, cache: "LayerRasterCache | None" = None) -> None:
+    def __init__(self, cache: "LayerRasterCache | None" = None,
+                 sandwich: "SandwichCache | None" = None) -> None:
         self._scratch = PlanarScratch(max_per_shape=3)
         self._cache = cache
+        # Reuses the composited layers above and below the one being edited.
+        # Only set on the single-threaded path: band-parallel rendering
+        # already splits the work, and a per-band sandwich would cache
+        # twenty slivers instead of two frames.
+        self._sandwich = sandwich
+        self.focus_layer_id: str | None = None
         # Origin of the band currently being composited. Band-parallel
         # rendering composites horizontal slices of the document
         # independently; each slice is a normal composite whose canvas is
@@ -416,6 +423,22 @@ class PlanarCompositor:
             if clippable[i + 1].clipping_mask:
                 needs_placed.add(clippable[i].id)
 
+        # --- Sandwich caching -------------------------------------------
+        # Split the draw list around the layer being edited so the layers
+        # that did not change can be reused. Falls back to a full walk
+        # whenever the split is not safe.
+        sandwich_plan = self._plan_sandwich(visible, regular_children)
+        if sandwich_plan is not None:
+            under, split_index, over_run, over_key = sandwich_plan
+            if under is not None:
+                np.copyto(canvas, under)
+                visible = visible[split_index:]
+        else:
+            under = None
+            split_index = 0
+            over_run = []
+            over_key = None
+
         prev_img: np.ndarray | None = None
         borrowed: list[np.ndarray] = []
 
@@ -564,6 +587,131 @@ class PlanarCompositor:
             np.copyto(out_buf, canvas)
             canvas = out_buf
         return canvas
+
+    # ------------------------------------------------------------------
+    # Sandwich planning
+    # ------------------------------------------------------------------
+
+    def _sandwich_key(self, run) -> tuple:
+        """Cache key: what the run contains, and how it is being rendered."""
+        from .sandwich_cache import run_signature
+        return (run_signature(run), self._level, self._frame_roi,
+                self._ox, self._oy)
+
+    def _plan_sandwich(self, visible, regular_children):
+        """Decide whether the layers below the focus can be reused.
+
+        Returns ``(under_canvas_or_None, split_index, over_run, over_key)``
+        or ``None`` when caching does not apply to this composite.
+        """
+        cache = self._sandwich
+        focus = self.focus_layer_id
+        if cache is None or focus is None or len(visible) < 3:
+            return None
+        index = next((i for i, l in enumerate(visible) if l.id == focus), -1)
+        # A focus at the very bottom has nothing below it worth caching.
+        if index <= 0:
+            return None
+
+        below = visible[:index]
+        # Any root adjustment or filter below consumes the accumulated
+        # canvas, which is still fine -- it is part of what we cache. But a
+        # clipping-mask chain crossing the split is not: the focus layer
+        # would need the placed pixels of the layer beneath it, which the
+        # cached buffer no longer carries separately.
+        if visible[index].clipping_mask:
+            return None
+
+        key = self._sandwich_key(below)
+        under = cache.get_under(key)
+        if under is None:
+            return (None, 0, [], None)      # nothing cached yet this frame
+        return (under, index, [], None)
+
+    def prime_sandwich(self, stack: LayerStack, width: int, height: int,
+                       focus_layer_id: str, level: int = 0,
+                       origin: tuple[int, int] = (0, 0),
+                       frame_roi=None) -> bool:
+        """Composite and cache everything below *focus_layer_id*.
+
+        Called once when an interaction begins. Returns True when a usable
+        under-cache was produced.
+        """
+        cache = self._sandwich
+        if cache is None:
+            return False
+        self._ox, self._oy = origin
+        self._level = level
+        self._scale = 1.0 / (1 << level)
+        self._frame_roi = frame_roi
+
+        visible = self._root_draw_list(stack)
+        index = next((i for i, l in enumerate(visible)
+                      if l.id == focus_layer_id), -1)
+        if index <= 0 or len(visible) < 3 or visible[index].clipping_mask:
+            cache.clear()
+            return False
+
+        below = visible[:index]
+        key = self._sandwich_key(below)
+        if cache.get_under(key) is not None:
+            return True
+
+        # Composite just the layers below, through the ordinary path.
+        saved_focus = self.focus_layer_id
+        self.focus_layer_id = None
+        try:
+            partial = self._composite_subset(stack, below, width, height,
+                                             level=level, origin=origin,
+                                             frame_roi=frame_roi)
+        finally:
+            self.focus_layer_id = saved_focus
+        cache.put_under(key, partial)
+        return True
+
+    def _root_draw_list(self, stack: LayerStack) -> list[Layer]:
+        """The root-level layers that composite(), in order, would draw."""
+        layers = list(stack)
+        mask_layer_ids = {mid for l in layers for mid in l.mask_layers}
+        adj_child_ids = {
+            l.id for l in layers
+            if l.parent_id
+            and l.layer_type in (LayerType.ADJUSTMENT, LayerType.FILTER)
+            and l.visible
+        }
+        standalone_mask_ids = {
+            l.id for l in layers
+            if l.layer_type == LayerType.MASK and l.parent_id is None
+            and l.id not in mask_layer_ids
+        }
+        return [
+            l for l in layers
+            if l.visible and l.parent_id is None
+            and l.id not in mask_layer_ids
+            and (l.layer_type != LayerType.MASK or l.id in standalone_mask_ids)
+            and l.id not in adj_child_ids
+        ]
+
+    def _composite_subset(self, stack: LayerStack, subset: list[Layer],
+                          width: int, height: int, level: int,
+                          origin, frame_roi) -> np.ndarray:
+        """Composite only *subset* of the root layers, in order.
+
+        Implemented by hiding the other root layers for the duration, so
+        the one compositing routine stays the single source of truth for
+        every clipping, grouping and masking rule.
+        """
+        keep = {l.id for l in subset}
+        hidden = [l for l in self._root_draw_list(stack) if l.id not in keep]
+        saved = [(l, l.visible) for l in hidden]
+        for layer, _ in saved:
+            layer.visible = False
+        try:
+            return self.composite(stack, width, height, origin=origin,
+                                  level=level, frame_roi=frame_roi).copy()
+        finally:
+            for layer, was_visible in saved:
+                layer.visible = was_visible
 
     def _blend_clipped_child(
         self, canvas: np.ndarray, child: Layer, stack: LayerStack,

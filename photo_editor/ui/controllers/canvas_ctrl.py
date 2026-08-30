@@ -69,6 +69,23 @@ class CanvasController(ControllerBase):
                 mw._canvas.set_source_offset((ox, oy))
             self.signals.clone_preview_requested.emit(x, y)
 
+    def _begin_interaction(self) -> None:
+        """Tell the pipeline which layer is being edited.
+
+        Everything below it is then composited once and reused for the rest
+        of the drag, so a frame costs a copy plus one blend instead of a
+        full walk of the stack.
+        """
+        mw = self._mw
+        doc = mw._doc
+        if doc is None:
+            return
+        active = doc.layers.active_layer
+        mw._pipeline.begin_interaction(active.id if active else None)
+
+    def _end_interaction(self) -> None:
+        self._mw._pipeline.end_interaction()
+
     def _prime_snapping(self) -> None:
         """Give the Move tool the view state its snapping needs.
 
@@ -104,6 +121,7 @@ class CanvasController(ControllerBase):
         mw = self._mw
         self._dragging = True
         self._prime_snapping()
+        self._begin_interaction()
 
         modifiers = QApplication.keyboardModifiers()
         if modifiers & Qt.KeyboardModifier.AltModifier:
@@ -242,6 +260,7 @@ class CanvasController(ControllerBase):
 
     def on_release(self, x: int, y: int) -> None:
         self._mw._canvas.set_snap_lines([])
+        self._end_interaction()
         mw = self._mw
         self._dragging = False
         if self._sel_moving:
