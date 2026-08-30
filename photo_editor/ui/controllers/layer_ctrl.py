@@ -376,6 +376,14 @@ class LayerController(ControllerBase):
             return
         display_ids = self.ctx.layer_row_ids()
         new_stack_order = reordered_stack_order(display_ids, layer_ids, target_visual_row)
+        # reordered_stack_order derives the WHOLE stack order from the rows
+        # the panel is showing, so a partial view yields a partial order and
+        # reorder_by_ids would drop every layer missing from it. The panel
+        # disables dragging while filtered; this is the backstop.
+        if len(new_stack_order) != len(self.doc.layers.layers):
+            self.ctx.show_status_message(
+                "Clear the layer filter before reordering", 3000)
+            return
         self.ctx.execute_command(ReorderLayersCommand(new_stack_order))
 
     def on_layers_reparented(self, layer_ids: list[str], group_id: str) -> None:

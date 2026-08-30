@@ -97,6 +97,11 @@ class LayerListWidget(QListWidget):
 
         self.setItemDelegate(LayerItemDelegate(self))
 
+        # Reordering is refused while the panel shows a filtered subset:
+        # a drop position among a subset says nothing about where the hidden
+        # layers belong, and the reorder is computed from the visible rows.
+        self.reorder_enabled = True
+
         # ---- drag state (ref, not reactive state) --------------------------
         self._drag = DragState()
         self._children_map: dict[str, list[str]] = {}
@@ -226,6 +231,8 @@ class LayerListWidget(QListWidget):
         layer_id = item.data(ROLE_LAYER_ID)
         if not layer_id:
             return
+        if not self.reorder_enabled:
+            return          # selection still works; dragging does not
 
         # Prepare drag ref
         self._drag.reset()

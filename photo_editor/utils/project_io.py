@@ -51,6 +51,7 @@ Why this is fast
 from __future__ import annotations
 
 import io
+import itertools
 import json
 import os
 import zipfile
@@ -79,6 +80,8 @@ _FORMAT_VERSION = 4
 
 # Entries with this suffix hold zlib-compressed .npy bytes. The container
 # itself is stored uncompressed so the data is not compressed twice.
+_TMP_COUNTER = itertools.count()
+
 _Z_SUFFIX = ".z"
 _ZLIB_LEVEL = 1
 _MAX_IO_WORKERS = 8
@@ -105,7 +108,12 @@ def save_basera_project(document: Document, path: str | Path) -> None:
     """
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = target.with_suffix(target.suffix + ".tmp")
+    # Unique per writer: a background Ctrl+S and the blocking save on quit
+    # both target the same file, and a shared ".tmp" path meant the second
+    # writer truncated the first one's partial archive and os.replace() then
+    # published whichever finished last -- a corrupt project either way.
+    tmp = target.with_suffix(
+        f"{target.suffix}.{os.getpid()}.{next(_TMP_COUNTER)}.tmp")
 
     try:
         _write_zip(document, tmp)

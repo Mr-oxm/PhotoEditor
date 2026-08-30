@@ -351,15 +351,27 @@ class LayersPanel(QWidget):
         if self._doc is None:
             return
         self.refresh(self._doc, thumbnails=True, force=True)
-        if self._filter.is_active:
+        # Reordering against a filtered view is ambiguous -- the panel shows
+        # a subset, so a drop position says nothing about where the hidden
+        # layers should end up. Dragging is therefore disabled while a filter
+        # is active; without this the reorder rebuilt the stack from the
+        # visible rows alone and every non-matching layer was lost.
+        active = self._filter.is_active
+        self._list.reorder_enabled = not active
+        if active:
             hits = match_count(self._doc, self._filter)
             total = len(self._doc.layers.layers)
             self._filter_status.setText(
-                f"{hits} of {total} layers match"
+                f"{hits} of {total} layers match — clear the filter to reorder"
                 if hits else "No layers match")
             self._filter_status.setVisible(True)
         else:
             self._filter_status.setVisible(False)
+
+    @property
+    def filtering(self) -> bool:
+        """True when the panel is showing a subset of the stack."""
+        return self._filter.is_active
 
     @property
     def layer_filter(self) -> LayerFilter:

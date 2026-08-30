@@ -211,3 +211,31 @@ def test_pipeline_epoch_blocks_stale_cache_publication():
     pipe.invalidate()
     assert pipe._epoch != epoch_before
     assert not pipe._uint8_valid
+
+
+def test_scheduler_is_genuinely_double_buffered(win, qtbot):
+    """The UI thread converts frame N to a QPixmap while the worker may
+    already be compositing frame N+1, so the two must never share a buffer.
+
+    They did: the scheduler adopted whatever execute_to_uint8 returned, which
+    is the pipeline's own internal buffer, so both slots ended up pointing at
+    one array.
+    """
+    doc = win._doc
+    _add_flat_layer(doc, 0.5, w=doc.width, h=doc.height)
+
+    seen = set()
+    for _ in range(5):
+        _render_and_wait(win, qtbot)
+        for buf in win._render_scheduler._buffers:
+            if buf is not None:
+                seen.add(id(buf))
+
+    assert len(seen) >= 2, (
+        f"scheduler used {len(seen)} distinct output buffer(s); double "
+        "buffering has collapsed and a worker can overwrite the frame the "
+        "UI thread is reading")
+    pipeline_buf = win._pipeline._uint8_buf
+    if pipeline_buf is not None:
+        assert id(pipeline_buf) not in seen, (
+            "scheduler buffers alias the pipeline's internal buffer")

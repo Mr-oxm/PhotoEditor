@@ -778,3 +778,44 @@ class TestSaveCrashResilience:
         assert "Saved" in status_messages, (
             "The 'Saved' status must fire even when the callback crashes"
         )
+
+
+def test_concurrent_saves_do_not_share_a_temp_path(tmp_path):
+    """A background Ctrl+S and the blocking save on quit both target the same
+    file. With a shared '<target>.tmp' the second writer truncated the first
+    one's partial archive and os.replace() published whichever finished last
+    -- a corrupt project either way."""
+    import threading
+
+    import numpy as np
+    from photo_editor.utils.project_io import (
+        load_basera_project, save_basera_project,
+    )
+
+    target = tmp_path / "shared.basera"
+    docs = []
+    for value in (0.25, 0.75):
+        doc = _make_document()
+        layer = doc.add_layer(name="L")
+        layer.pixels[:] = np.array([value] * 4, dtype=np.float32)
+        docs.append(doc)
+
+    errors = []
+
+    def save(doc):
+        try:
+            save_basera_project(doc, target)
+        except Exception as exc:      # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=save, args=(d,)) for d in docs]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, f"concurrent saves raised: {errors}"
+    # Whichever won, the file must be a complete, loadable project.
+    loaded = load_basera_project(target)
+    assert any(l.name == "L" for l in loaded.layers)
+    assert not list(tmp_path.glob("*.tmp")), "temp files were left behind"

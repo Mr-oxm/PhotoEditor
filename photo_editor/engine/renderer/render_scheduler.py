@@ -64,9 +64,14 @@ class RenderScheduler(QObject):
 
         # Two output buffers, handed out alternately, so a frame being
         # converted to a QPixmap on the UI thread is never the buffer the
-        # worker is writing.
+        # worker is writing. The scheduler ALLOCATES these itself: adopting
+        # whatever execute_to_uint8 returned made both slots point at the
+        # pipeline's own internal buffer, so the "double buffering" was one
+        # array under two names and the worker overwrote the frame the UI
+        # thread was still reading.
         self._buffers: list[np.ndarray | None] = [None, None]
         self._buffer_index = 0
+        self._buffer_shape: tuple[int, int, int] | None = None
         # Document-space rectangle to render, set by the canvas as the view
         # changes. None means the whole document.
         self._roi: tuple[int, int, int, int] | None = None
@@ -146,9 +151,23 @@ class RenderScheduler(QObject):
         """False once a newer request has arrived -- lets a worker bail out."""
         return generation_id >= self._generation
 
-    def _next_buffer(self) -> np.ndarray | None:
+    def _next_buffer(self, shape: tuple[int, int, int] | None) -> np.ndarray | None:
+        """The buffer this job should write into, alternating between two.
+
+        Returns None when the output shape is not yet known; the first frame
+        then allocates through the pipeline and the shape is learned from it.
+        """
         self._buffer_index ^= 1
-        return self._buffers[self._buffer_index]
+        if shape is None:
+            return None
+        if self._buffer_shape != shape:
+            self._buffers = [None, None]
+            self._buffer_shape = shape
+        buf = self._buffers[self._buffer_index]
+        if buf is None:
+            buf = np.empty(shape, dtype=np.uint8)
+            self._buffers[self._buffer_index] = buf
+        return buf
 
     def _run_worker(self, job: _PendingJob) -> None:
         self._in_flight = True
@@ -159,7 +178,7 @@ class RenderScheduler(QObject):
             generation_id=job.generation_id,
             full_refresh=job.full_refresh,
             is_current=self._is_current,
-            out=self._next_buffer(),
+            out=self._next_buffer(self._buffer_shape),
         )
         worker.signals.finished.connect(self._on_finished)
         worker.signals.error.connect(self._on_error)
@@ -174,9 +193,14 @@ class RenderScheduler(QObject):
         drag, so older results are dropped rather than painted.
         """
         self._in_flight = False
-        # Keep the buffer we were handed so it can be reused next time round.
-        if isinstance(rgba, np.ndarray):
-            self._buffers[self._buffer_index] = rgba
+        # Learn the output shape from the first frame so subsequent frames
+        # get a scheduler-owned buffer of the right size. The frame itself is
+        # NOT adopted -- it may be the pipeline's internal buffer.
+        if isinstance(rgba, np.ndarray) and rgba.dtype == np.uint8:
+            shape = (rgba.shape[0], rgba.shape[1], rgba.shape[2])
+            if self._buffer_shape != shape:
+                self._buffer_shape = shape
+                self._buffers = [None, None]
         if generation_id >= self._last_shown_generation:
             self._last_shown_generation = generation_id
             self.render_ready.emit(rgba, generation_id, full_refresh,

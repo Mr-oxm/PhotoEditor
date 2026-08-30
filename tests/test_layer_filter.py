@@ -267,3 +267,55 @@ def test_kind_combo_filters(qtbot):
     panel._kind_combo.setCurrentIndex(index)
     shown = {l.name for l in doc.layers if l.id in set(_rows(panel))}
     assert shown == {"Caption"}
+
+
+def test_dragging_is_disabled_while_filtering(qtbot):
+    """A drop position in a filtered view says nothing about where the
+    hidden layers belong, so reordering is refused rather than guessed."""
+    doc, _ = _doc()
+    panel = _panel(qtbot)
+    panel.refresh(doc)
+    assert panel._list.reorder_enabled
+
+    panel._search.setText("Sky")
+    assert not panel._list.reorder_enabled, "drag stayed enabled while filtered"
+    assert panel.filtering
+
+    panel.clear_filter()
+    assert panel._list.reorder_enabled, "drag was not restored"
+    assert not panel.filtering
+
+
+def test_a_filtered_reorder_would_have_dropped_layers():
+    """Pins the shape of the bug: reordered_stack_order derives the WHOLE
+    stack order from the rows it is given, so a filtered view yields a
+    partial order. That is why dragging is disabled rather than remapped."""
+    from photo_editor.ui.services.layer_panel_state import reordered_stack_order
+
+    doc, by_name = _doc()
+    visible = [by_name["Sky"].id, by_name["Clouds"].id]      # a filtered view
+    order = reordered_stack_order(visible, [by_name["Clouds"].id], 0)
+    assert len(order) < len(doc.layers.layers), (
+        "this test no longer describes the hazard it guards")
+
+
+def test_controller_refuses_a_partial_reorder(qtbot):
+    """Backstop for anything that emits the signal while filtered."""
+    from photo_editor.ui.main_window import MainWindow
+
+    win = MainWindow(dev_mode=True)
+    qtbot.addWidget(win)
+    try:
+        doc = win._doc
+        for name in ("A", "B", "C"):
+            doc.add_layer(name=name)
+        before = [l.id for l in doc.layers]
+
+        # Emit a reorder derived from only two of the rows.
+        win._layer_ctrl.on_layers_reordered([before[1]], 0)
+
+        assert [l.id for l in doc.layers] == before, (
+            "a partial reorder was applied and rewrote the stack")
+    finally:
+        win._autosave_timer.stop()
+        win._doc.mark_clean()

@@ -240,3 +240,53 @@ def test_frozen_buffers_are_read_only():
     layer.begin_write()
     layer.pixels[:] = 0.5      # now fine
     assert np.allclose(layer.pixels, 0.5)
+
+
+def test_content_versions_are_never_reused_across_a_restore():
+    """History shares buffers keyed on (layer id, content_version).
+
+    Restoring an undo state rebuilds Layer objects from scratch. With a
+    per-layer counter the version restarted at 1, so a snapshot taken after
+    an undo could collide with a stale (id, version) pair and silently share
+    the discarded branch's pixels.
+    """
+    doc = _doc(2)
+    layer = doc.layers.layers[1]
+    _edit(layer, 0.1)
+    seen = {layer.content_version}
+
+    for value in (0.2, 0.3, 0.4):
+        doc.save_snapshot(f"edit-{value}")
+        _edit(doc.layers.layers[1], value)
+        seen.add(doc.layers.layers[1].content_version)
+
+    doc.undo()
+    doc.undo()
+    restored = doc.layers.layers[1]
+    assert restored.content_version not in seen, (
+        "a restored layer reused a content version that history has already "
+        "associated with different pixels")
+
+    _edit(restored, 0.9)
+    assert restored.content_version not in seen
+
+
+def test_undo_after_a_restore_and_further_edits_is_correct():
+    """End-to-end version of the above: the pixels must follow the branch
+    actually taken, not a discarded one."""
+    doc = _doc(2)
+    layer = doc.layers.layers[1]
+    _edit(layer, 0.1)
+    doc.save_snapshot("s1")
+    _edit(doc.layers.layers[1], 0.2)
+    doc.undo()
+    doc.undo()
+
+    restored = doc.layers.layers[1]
+    assert np.allclose(restored.pixels, 0.1), "undo did not restore 0.1"
+
+    doc.save_snapshot("s2")
+    _edit(doc.layers.layers[1], 0.7)
+    doc.undo()
+    assert np.allclose(doc.layers.layers[1].pixels, 0.1), (
+        "the snapshot after a restore stored the wrong branch's pixels")
